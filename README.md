@@ -403,4 +403,13 @@ python scripts/prepare_nero_mujoco.py --xacro
 python scripts/check_mujoco_model.py
 ```
 
+Build and view the first interactive scene with a table and one position actuator per NERO joint:
+
+```bash
+python scripts/build_nero_scene.py
+python -m mujoco.viewer --mjcf=models/nero/nero_scene.xml
+```
+
+The actuators are low-level position actuators for simulation inspection only; they are not connected to `pyAgxArm` and cannot move the physical arm. The viewer's control sliders can be used to pose the joints.
+
 This is an offline model-loading milestone only. It does not connect to CAN or move the physical arm. After loading succeeds, the next step is to add an MJCF scene with a named end-effector site, conservative collision proxies, and a table before implementing IK and trajectory validation.
