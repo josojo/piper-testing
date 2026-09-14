@@ -11,6 +11,7 @@ import argparse
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -26,6 +27,27 @@ def fetch_repository(destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     print(f"Cloning {REPOSITORY} -> {destination}")
     subprocess.run(["git", "clone", "--depth", "1", REPOSITORY, str(destination)], check=True)
+
+
+def merge_official_gripper(source: Path, output: Path) -> None:
+    """Merge the official base, flange, and Piper-style gripper XML files."""
+    base = ET.parse(source / "nero/urdf/nero_description.urdf").getroot()
+    flange = ET.parse(source / "nero/urdf/nero_with_gripper_flange_description.xacro").getroot()
+    gripper = ET.parse(source / "nero/urdf/nero_with_gripper_description.xacro").getroot()
+    for component in (flange, gripper):
+        for child in component:
+            if child.tag.startswith("{") or child.tag in {"link", "joint"}:
+                if child.tag in {"link", "joint"}:
+                    if child.tag == "link" and child.get("name") == "gripper_link":
+                        inertial = ET.SubElement(child, "inertial")
+                        ET.SubElement(inertial, "mass", {"value": "0.001"})
+                        ET.SubElement(inertial, "inertia", {
+                            "ixx": "1e-8", "ixy": "0", "ixz": "0",
+                            "iyy": "1e-8", "iyz": "0", "izz": "1e-8",
+                        })
+                    base.append(child)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(base).write(output, encoding="utf-8", xml_declaration=True)
 
 
 def expand_xacro(source: Path, output: Path) -> None:
@@ -78,6 +100,8 @@ def main() -> int:
                         help="generated standalone URDF")
     parser.add_argument("--xacro", action="store_true",
                         help="expand nero_with_gripper_description.xacro via xacro")
+    parser.add_argument("--no-gripper", action="store_true",
+                        help="prepare the seven-joint arm without the official gripper")
     parser.add_argument("--no-clone", action="store_true",
                         help="require --source to already exist")
     args = parser.parse_args()
@@ -86,8 +110,15 @@ def main() -> int:
     if not args.no_clone:
         fetch_repository(source)
     urdf_dir = source / "nero" / "urdf"
-    input_path = urdf_dir / ("nero_with_gripper_description.xacro" if args.xacro
-                             else "nero_description.urdf")
+    if args.xacro and args.no_gripper:
+        parser.error("--xacro and --no-gripper cannot be combined")
+    if args.xacro:
+        input_path = urdf_dir / "nero_with_gripper_description.xacro"
+    elif args.no_gripper:
+        input_path = urdf_dir / "nero_description.urdf"
+    else:
+        input_path = args.output.with_suffix(".merged.urdf")
+        merge_official_gripper(source, input_path)
     if not input_path.is_file():
         print(f"Missing official model file: {input_path}", file=sys.stderr)
         return 2

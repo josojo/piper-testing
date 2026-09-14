@@ -1,0 +1,7 @@
+{
+  "frame": "nero_base",
+  "position_m": [0.02, 0.0, 0.89101],
+  "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+  "gripper": 1.0,
+  "reason": "Short reach above the table from the zero-joint pose"
+}

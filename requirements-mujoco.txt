@@ -1,4 +1,3 @@
-# Offline NERO model loading and planning foundation.
+# Offline NERO model loading, numerical IK, and conservative path validation.
 mujoco>=3.2,<4
 numpy>=1.24
-

@@ -362,9 +362,9 @@ The simulator should make dangerous motions less likely. It cannot guarantee tha
 
 ## Current repository status
 
-The repository currently contains direct Python/CAN control and safety scripts for NERO. The MuJoCo planner, NERO MJCF model, camera interface, and Astra interface are not implemented yet.
+The repository contains direct Python/CAN control and safety scripts, an official-URDF-derived NERO MuJoCo scene, and a simulation-only pose executor in `nero_planner`. The executor provides numerical IK, timed joint interpolation, conservative full-path collision/clearance validation, and kinematic playback. Camera/Astra integration and a hardware trajectory adapter are not implemented.
 
-The first useful code milestone is a simulation-only target executor:
+The implemented milestone is a simulation-only target executor:
 
 ```text
 hard-coded Pose
@@ -374,7 +374,7 @@ hard-coded Pose
 → visualization
 ```
 
-Only after this works should the validated trajectory be connected to `pyAgxArm`.
+The simulation executor does not import `pyAgxArm` or connect to CAN. Its validation is relative to the proxy model and documented contact exclusions; it is not hardware clearance certification.
 
 ## Preparing the MuJoCo environment
 
@@ -389,14 +389,14 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-mujoco.txt
 ```
 
-Fetch the official base URDF and rewrite its mesh paths for standalone MuJoCo loading:
+Fetch the official NERO URDF plus its Piper-style gripper and rewrite mesh paths for standalone MuJoCo loading:
 
 ```bash
 python scripts/prepare_nero_mujoco.py
 python scripts/check_mujoco_model.py
 ```
 
-The checker must report a loaded model and the NERO joint list. If the gripper Xacro is needed, install the ROS `xacro` command in the environment and run:
+The checker must report a loaded model and the NERO plus gripper joint list. The default preparation merges the official gripper files directly. If you prefer ROS Xacro expansion, install the ROS `xacro` command and run:
 
 ```bash
 python scripts/prepare_nero_mujoco.py --xacro
@@ -410,6 +410,73 @@ python scripts/build_nero_scene.py
 python -m mujoco.viewer --mjcf=models/nero/nero_scene.xml
 ```
 
-The actuators are conservative position actuators for simulation inspection only; they are not connected to `pyAgxArm` and cannot move the physical arm. This inspection scene disables gravity and detailed-mesh collisions because the vendor URDF does not contain tuned dynamics. The table is visual for now; collision proxies will be added with the planner. The viewer's control sliders can be used to pose the joints.
+The actuators are conservative position actuators for simulation inspection only; they are not connected to `pyAgxArm` and cannot move the physical arm. The scene includes the official Piper-style gripper and a fixed red apple on the table. Gravity is disabled and detailed meshes are visual-only. Padded boxes provide planning collision geometry; the vendor dynamics are not calibrated. The raw viewer's control sliders are for inspection, not validated execution.
 
-This is an offline model-loading milestone only. It does not connect to CAN or move the physical arm. After loading succeeds, the next step is to add an MJCF scene with a named end-effector site, conservative collision proxies, and a table before implementing IK and trajectory validation.
+## Running the simulation-only executor
+
+After preparing the URDF, rebuild the scene to add the planning geometry and tool site:
+
+```bash
+source .venv/bin/activate
+python scripts/build_nero_scene.py
+python -m nero_planner --demo
+python -m nero_planner --target examples/reach.json --output /tmp/nero-trajectory.json
+python -m nero_planner --demo --viewer
+```
+
+Without `--viewer`, execution is headless kinematic playback. With it, the viewer replays the same quintic joint path in real time and closes at completion. Neither mode steps actuator dynamics. Successful commands print a JSON summary with the achieved pose and validation metrics. Rejected requests print a JSON reason to stderr and exit with status 2. `--output` writes the complete trajectory and achieved pose after successful execution; this report is not an executable hardware command or an importable validation token.
+
+`--start path.json` supplies a JSON array of seven joint angles in radians, ordered `joint1` through `joint7`. The default is the all-zero configuration, with all three gripper joints explicitly synchronized to fully open. The demo moves the grasp center 2 cm in base +X and 2 mm in base -Z, preserving orientation. `examples/reach.json` is an equivalent fixed target for the default starting pose.
+
+The target interface accepts `frame`, `position_m`, `orientation_xyzw`, optional `gripper`, and optional text `reason`. Only `frame="nero_base"` and `gripper=1.0` are supported in this milestone. A quaternion must be finite and unit length within 0.001; small roundoff is normalized, and opposite quaternion signs are equivalent. Unknown fields, unsupported frames, nonfinite numbers, and gripper movement requests are rejected.
+
+The controlled `grasp_center` site is the midpoint of the two finger joint origins at zero opening, using the gripper-base orientation (+Z approach direction). It lies 0.138 m along the vendor gripper-base +Z axis. The fixed transform is derived from the compiled URDF, including the flange attachment, and the site is attached to `link7`. In the zero arm pose it is approximately `[0, 0, 0.89301]` metres in `nero_base`. This convention is a model tool frame, not a measured physical TCP calibration.
+
+### Planning and validation defaults
+
+`--limits path.json` accepts a JSON object overriding fields of `nero_planner.Limits`. Defaults are:
+
+| Setting | Default |
+| --- | --- |
+| Forbidden-pair clearance | 0.03 m |
+| Maximum joint velocity | 0.2 rad/s |
+| Maximum joint acceleration | 0.5 rad/s² |
+| Maximum per-joint displacement per request | 0.25 rad |
+| Maximum target translation per request | 0.05 m |
+| Final position/orientation tolerances | 0.002 m / 2° |
+| Maximum execution duration | 15 s |
+| Playback sample period | 0.02 s |
+| Maximum clearance subdivision depth | 16 |
+| Maximum validation samples / trajectory samples | 20,000 each |
+| Maximum IK iterations | 400 |
+
+These are simulation defaults, not calibrated NERO hardware limits. For example, `{"max_velocity_rad_s": 0.1}` halves the allowed velocity. Joint-position bounds come from the imported model. The planner uses the current simulated joint configuration as the numerical IK seed and applies damping, joint bounds, and a small posture preference. Failure to converge within bounded joint motion is rejected; it does not search alternative routes around obstacles.
+
+The joint path uses `s(u) = 10u³ - 15u⁴ + 6u⁵`, with duration chosen from the exact peak velocity and acceleration of that polynomial. Every configuration stays between its endpoints in joint space. A `ValidatedTrajectory` carries immutable tuples of joint names, positions, timestamps, target pose, captured starting state, validation metrics, and limits. Planning restores the original simulator state. Playback accepts only an unmodified trajectory issued by that planner and rechecks the complete starting joint state, zero velocity, scene fingerprint, and limits. Load a new planner after editing a scene; re-plan after the arm state changes.
+
+### Collision geometry and explicit exclusions
+
+Every imported robot mesh is enclosed by an oriented box padded by 3 mm on each side. A box also encloses the fixed apple and stem with 3 mm padding. The table top remains at `z=0`. The viewer executor hides proxy group 3 by default; enable that group in the viewer to inspect the boxes. Tests verify that the boxes contain every mesh vertex at multiple arm poses.
+
+Validation queries MuJoCo forward kinematics and evaluates all forbidden box pairs, including separated pairs without contacts. It uses the 15 separating axes for oriented boxes to obtain a conservative distance lower bound. This avoids the documented positive-distance limitations of some colliders in older MuJoCo releases ([MuJoCo 3.2 API reference](https://mujoco.readthedocs.io/en/3.2.5/APIreference/APIfunctions.html#mj-geomdistance)). The reported clearance is a certified lower bound, not an exact closest-point distance.
+
+At each interval midpoint, validation subtracts a conservative bound on both geometries' possible motion over the interval. If the remaining distance exceeds the configured clearance, the entire interval is certified. Otherwise it bisects the joint interval, rejecting on a clearance violation or an exhausted depth/sample budget. Checking only endpoints or `data.ncon` is insufficient.
+
+The explicit structural exclusions in `nero_planner/model.py` are:
+
+- Geometries rigidly attached to the same robot body.
+- Adjacent arm-body pairs (`world/link1`, `link1/link2`, through `link6/link7`) and gripper housing/finger pairs (`link7/gripper_link1`, `link7/gripper_link2`).
+- The compact shoulder assembly `world/link2` and wrist assembly `link5/link7`, whose enclosing boxes overlap across an intermediate joint body.
+- The fixed base proxy against the table and tabletop; environment/environment contacts are also outside robot-motion validation.
+
+All other robot/table, robot/apple, and robot/robot pairs must maintain clearance, including finger/finger pairs. Additional fixed box obstacles with collision enabled are checked too. Unsupported non-box collision shapes or movable obstacles are rejected at load time. **Excluded assembly pairs are not collision-checked**, even if a configuration could produce a real collision within that assembly. These explicit model limitations must be reviewed, and proxy geometry refined as necessary, before any hardware use. No grasp contacts are permitted.
+
+### Offline acceptance tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+This builds an isolated scene from the prepared URDF and tests successful reaching, mesh enclosure, tool/gripper conventions, table/apple/self-collision rejection, near misses without forbidden contacts, unsafe path interiors with safe endpoints, validation-budget exhaustion, pose/step/timing limits, malformed inputs, stale states/scenes, and modified trajectory rejection. It requires neither CAN nor a display. The root-level `test_nero.py`, `test_backend.py`, and related scripts are existing hardware utilities and are not part of this offline suite.
+
+Remaining milestones are hardware FK/TCP calibration, refined assembly collision models, dynamic tracking validation, supervised hardware integration, camera calibration, and Astra target selection.
