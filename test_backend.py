@@ -1,11 +1,8 @@
 import can
 import time
+from nero_safety_common import nero_can_config
 
-bus = can.Bus(
-      interface="gs_usb",
-      channel=0,
-      bitrate=1_000_000,
-  )
+bus = can.Bus(**nero_can_config())
 
 print("Listening for CAN frames for 10 seconds...")
 

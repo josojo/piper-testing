@@ -1,12 +1,7 @@
 import time
+import os
 
-from pyAgxArm import (
-      create_agx_arm_config,
-      AgxArmFactory,
-      ArmModel,
-      NeroFW,
-)
-from nero_safety_common import disconnect_nero
+from nero_safety_common import connect_nero, disconnect_nero
 
 # Safety settings for the first motion.
 #
@@ -18,27 +13,21 @@ SAFETY_MARGIN = 0.030      # 3 cm above the platform
 MOVE_X_METERS = -0.005     # first test move: 5 mm in -X
 SPEED_PERCENT = 10
 ENABLE_MOTORS = True       # set False when enabling manually via the UI
+# Disable before closing CAN so Nero is not left in CAN-control mode between
+# invocations. Set False only if the arm is mechanically supported and must
+# remain enabled after this script exits.
+DISABLE_ON_EXIT = True
 ENABLE_TIMEOUT = 10.0
 ENABLE_RECONNECT_ATTEMPTS = 2
 MOTION_TIMEOUT = 10.0
 STARTUP_TIMEOUT = 15.0
 NORMAL_TIMEOUT = 5.0
 
-# The connected adapter is a native candleLight/gs_usb device
-# (VID 0x1d50, PID 0x606f), so use the gs_usb backend on macOS too.
-# Do not use slcan unless the adapter has explicitly been flashed with
-# SLCAN firmware and appears as /dev/cu.usbmodem* or /dev/cu.usbserial*.
-config = create_agx_arm_config(
-      robot=ArmModel.NERO,
-      # The connected arm reported firmware 1.21.  Use the matching profile.
-      firmeware_version=NeroFW.V121,
-      interface="gs_usb",
-      channel=0,
-      bitrate=1_000_000,
-  )
-
-print("Configuration created:", config["comm"]["can"])
-robot = AgxArmFactory.create_arm(config)
+print(
+      "Configuration: macOS CandleLight backend "
+      f"({os.environ.get('NERO_CAN_INTERFACE', 'gs_usb')})"
+)
+robot = None
 connected = False
 
 
@@ -102,7 +91,7 @@ def wait_for_normal_state(robot, timeout=NORMAL_TIMEOUT):
 
 try:
       print("Connecting...")
-      robot.connect()
+      robot = connect_nero()
       connected = True
       print("Connected")
       startup_status = wait_for_arm_status(robot)
@@ -253,5 +242,12 @@ try:
 
 finally:
       if connected:
+            if DISABLE_ON_EXIT:
+                  try:
+                        print("Disabling all motor joints before disconnect...")
+                        robot.disable()
+                        time.sleep(0.5)
+                  except Exception as exc:
+                        print(f"Warning: could not disable joints cleanly: {exc}")
             disconnect_nero(robot)
             print("Disconnected")
