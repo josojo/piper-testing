@@ -1,16 +1,18 @@
 import time
 import os
+import platform
 
 from nero_safety_common import connect_nero, disconnect_nero
 
-# Safety settings for the first motion.
+# Safety settings for the first joint-space motion.
 #
 # Measure PLATFORM_TOP_Z in the Nero base coordinate frame before running.
 # Leave it as None until you have measured it; the script will refuse to move.
 PLATFORM_TOP_Z = 0.001      # metres; measured platform height
 TOOL_LOWEST_POINT = 0.0    # metres below the flange, including any tool
 SAFETY_MARGIN = 0.030      # 3 cm above the platform
-MOVE_X_METERS = -0.005     # first test move: 5 mm in -X
+MOVE_JOINT_INDEX = 0       # zero-based index; 0 is joint 1
+MOVE_JOINT_DELTA_RAD = 0.05  # about 2.86 degrees; visibly larger test move
 SPEED_PERCENT = 10
 ENABLE_MOTORS = True       # set False when enabling manually via the UI
 # Disable before closing CAN so Nero is not left in CAN-control mode between
@@ -22,11 +24,23 @@ ENABLE_RECONNECT_ATTEMPTS = 2
 MOTION_TIMEOUT = 10.0
 STARTUP_TIMEOUT = 15.0
 NORMAL_TIMEOUT = 5.0
+RESET_TIMEOUT = 5.0
 
-print(
-      "Configuration: macOS CandleLight backend "
-      f"({os.environ.get('NERO_CAN_INTERFACE', 'gs_usb')})"
+can_interface = os.environ.get(
+      "NERO_CAN_INTERFACE",
+      "socketcan" if platform.system() == "Linux" else "slcan",
 )
+can_channel = os.environ.get(
+      "NERO_CAN_CHANNEL",
+      "can0" if platform.system() == "Linux" else "/dev/ttyACM0",
+)
+print(f"Configuration: {platform.system()} CAN backend")
+print(f"  interface={can_interface}, channel={can_channel}, bitrate=1000000")
+if platform.system() == "Linux":
+      print(
+            "Ubuntu prerequisite: activate the CAN interface first, for example: "
+            "sudo ip link set can0 up type can bitrate 1000000"
+      )
 robot = None
 connected = False
 
@@ -89,6 +103,35 @@ def wait_for_normal_state(robot, timeout=NORMAL_TIMEOUT):
             f"seconds (last state: {state})"
       )
 
+
+def reset_no_solution(robot, timeout=RESET_TIMEOUT):
+      """Clear a stale NO_SOLUTION state before enabling the motors."""
+      print("Arm reports NO_SOLUTION; sending one controller reset...")
+      robot.reset()
+      deadline = time.monotonic() + timeout
+      last_state = None
+      while time.monotonic() < deadline:
+            status = robot.get_arm_status()
+            if status is not None:
+                  last_state = status.msg.arm_status
+                  if last_state in (
+                        robot.ARM_STATUS.ArmStatus.NORMAL,
+                        robot.ARM_STATUS.ArmStatus.JOINT_BRAKE_NOT_RELEASED,
+                  ):
+                        print("Reset cleared the stale arm state:", last_state)
+                        return status
+                  if last_state == robot.ARM_STATUS.ArmStatus.EMERGENCY_STOP:
+                        raise RuntimeError(
+                              "Reset did not clear EMERGENCY_STOP; release the "
+                              "physical/UI emergency stop before continuing"
+                        )
+            time.sleep(0.1)
+      raise TimeoutError(
+            f"Reset did not clear NO_SOLUTION within {timeout:.1f} seconds "
+            f"(last state: {last_state}). Check the firmware version and "
+            "the last commanded target."
+      )
+
 try:
       print("Connecting...")
       robot = connect_nero()
@@ -108,10 +151,7 @@ try:
                         "expected until the enable command releases the brakes"
                   )
             elif startup_state == robot.ARM_STATUS.ArmStatus.NO_SOLUTION:
-                  raise RuntimeError(
-                        "Arm starts in NO_SOLUTION(0x2); reset it and verify "
-                        "the previous target is reachable before enabling or moving"
-                  )
+                  startup_status = reset_no_solution(robot)
             elif startup_state == robot.ARM_STATUS.ArmStatus.EMERGENCY_STOP:
                   raise RuntimeError(
                         "Arm starts in EMERGENCY_STOP(0x1); release the "
@@ -170,12 +210,6 @@ try:
 
       print("Communication OK:", robot.is_ok())
 
-      if PLATFORM_TOP_Z is None:
-            raise RuntimeError(
-                  "Set PLATFORM_TOP_Z to the measured platform height "
-                  "in the Nero base coordinate frame before moving."
-            )
-
       if not robot.is_ok():
             raise RuntimeError("Arm is not OK; refusing to move")
 
@@ -208,35 +242,41 @@ try:
       print("Firmware:", firmware["software_version"] if firmware else None)
 
       joints = robot.get_joint_angles()
-      print("Joint angles:", joints.msg if joints else None)
+      if joints is None:
+            raise RuntimeError("No valid joint-angle feedback; refusing to move")
+      current_joints = joints.msg.copy()
+      target_joints = current_joints.copy()
+      target_joints[MOVE_JOINT_INDEX] += MOVE_JOINT_DELTA_RAD
+      print("Current joint angles [rad]:", current_joints)
+      print("Target joint angles [rad]:", target_joints)
 
-      pose = robot.get_flange_pose()
-      if pose is None:
-            raise RuntimeError("No valid flange pose; refusing to move")
-
-      current = pose.msg.copy()
-      minimum_flange_z = PLATFORM_TOP_Z + SAFETY_MARGIN + TOOL_LOWEST_POINT
-      print("Current flange pose [m, rad]:", current)
-      print("Minimum allowed flange z [m]:", minimum_flange_z)
-
-      if current[2] < minimum_flange_z:
+      if PLATFORM_TOP_Z is None:
             raise RuntimeError(
-                  f"Current flange z={current[2]:.3f} m is below the "
-                  f"safe floor {minimum_flange_z:.3f} m"
+                  "Set PLATFORM_TOP_Z to the measured platform height "
+                  "in the Nero base coordinate frame before moving."
             )
 
-      target = current.copy()
-      target[0] += MOVE_X_METERS
-      if target[2] < minimum_flange_z:
-            raise RuntimeError("Target violates the height limit")
+      pose = robot.get_flange_pose()
+      if pose is not None:
+            minimum_flange_z = PLATFORM_TOP_Z + SAFETY_MARGIN + TOOL_LOWEST_POINT
+            print("Current flange pose [m, rad]:", pose.msg)
+            print("Minimum allowed current flange z [m]:", minimum_flange_z)
+            if pose.msg[2] < minimum_flange_z:
+                  raise RuntimeError(
+                        f"Current flange z={pose.msg[2]:.3f} m is below the "
+                        f"safe floor {minimum_flange_z:.3f} m"
+                  )
 
       robot.set_speed_percent(SPEED_PERCENT)
-      print(f"Planned linear move: {MOVE_X_METERS * 1000:.1f} mm in X")
+      print(
+            f"Planned joint move: joint {MOVE_JOINT_INDEX + 1}, "
+            f"{MOVE_JOINT_DELTA_RAD:.4f} rad"
+      )
       input(
             f"Press Enter to move at {SPEED_PERCENT}% speed, "
             "or Ctrl-C to abort: "
       )
-      robot.move_l(target)
+      robot.move_j(target_joints)
       wait_motion_done(robot)
       print("Motion completed")
 
