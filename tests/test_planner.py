@@ -164,6 +164,30 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(trajectory.validation.peak_velocity_rad_s, 0)
         self.assertEqual(trajectory.validation.peak_acceleration_rad_s2, 0)
 
+    def test_old_scene_reports_preparation_commands(self):
+        tree = ET.parse(self.scene_path)
+        root = tree.getroot()
+        root.remove(root.find("equality"))
+        actuators = root.find("actuator")
+        actuators.remove(actuators.find("position[@joint='gripper']"))
+        body = root.find(".//body[@name='gripper_link']")
+        body.remove(body.find("joint[@name='gripper']"))
+        path = Path(self.temp.name) / "old_scene.xml"
+        tree.write(path)
+        with self.assertRaises(ValueError) as caught:
+            Planner(path)
+        message = str(caught.exception)
+        self.assertIn("missing: gripper", message)
+        self.assertIn(str(path.resolve()), message)
+        self.assertIn("prepare_nero_mujoco.py", message)
+        self.assertIn("build_nero_scene.py", message)
+        # An incomplete input must not overwrite an existing generated scene.
+        output = Path(self.temp.name) / "preserved_scene.xml"
+        output.write_text("existing scene")
+        with self.assertRaisesRegex(SystemExit, "missing required joints: gripper"):
+            build(path, output)
+        self.assertEqual(output.read_text(), "existing scene")
+
     def test_extra_fixed_obstacles_and_unsupported_geometry(self):
         tree = ET.parse(self.scene_path)
         obstacle = ET.SubElement(tree.getroot().find("worldbody"), "geom", {

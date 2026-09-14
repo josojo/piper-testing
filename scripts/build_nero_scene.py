@@ -71,6 +71,14 @@ def build(model_path: Path, output_path: Path) -> None:
         raise SystemExit(f"Model not found: {model_path}\nRun scripts/prepare_nero_mujoco.py first")
 
     model = mujoco.MjModel.from_xml_path(str(model_path))
+    required_joints = JOINTS + [GRIPPER_JOINT, "gripper_joint1", "gripper_joint2"]
+    missing = [name for name in required_joints
+               if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name) < 0]
+    if missing:
+        raise SystemExit(
+            f"Prepared model {model_path} is missing required joints: {', '.join(missing)}. "
+            "Run `python scripts/prepare_nero_mujoco.py` without --no-gripper, then rebuild the scene."
+        )
     # Save the compiled URDF as MJCF so the scene can be extended with normal
     # MJCF elements. Saving beside the source keeps mesh paths valid.
     mujoco.mj_saveLastXML(str(output_path), model)

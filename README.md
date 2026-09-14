@@ -424,6 +424,18 @@ python -m nero_planner --target examples/reach.json --output /tmp/nero-trajector
 python -m nero_planner --demo --viewer
 ```
 
+On macOS, launch viewer playback with MuJoCo's `mjpython` launcher instead of `python`:
+
+```bash
+mjpython -m nero_planner --demo --viewer
+# Or explicitly use the virtual environment's launcher:
+.venv/bin/mjpython -m nero_planner --demo --viewer
+```
+
+MuJoCo installs `mjpython` with its macOS package. It satisfies the main-thread rendering requirement of `launch_passive` ([MuJoCo documentation](https://mujoco.readthedocs.io/en/stable/python.html#passive-viewer)). Model preparation and headless execution still use ordinary `python`; no scene rebuild is needed for this launcher error.
+
+If the executor reports `Required model element is missing: gripper`, your generated scene is outdated or was prepared without the gripper. Generated models are Git-ignored, so pulling new code does not update them. Run `python scripts/prepare_nero_mujoco.py` without `--no-gripper`, then `python scripts/build_nero_scene.py`, and retry the executor. The error includes the exact scene path being loaded; a custom `--scene` must also be regenerated.
+
 Without `--viewer`, execution is headless kinematic playback. With it, the viewer replays the same quintic joint path in real time and closes at completion. Neither mode steps actuator dynamics. Successful commands print a JSON summary with the achieved pose and validation metrics. Rejected requests print a JSON reason to stderr and exit with status 2. `--output` writes the complete trajectory and achieved pose after successful execution; this report is not an executable hardware command or an importable validation token.
 
 `--start path.json` supplies a JSON array of seven joint angles in radians, ordered `joint1` through `joint7`. The default is the all-zero configuration, with all three gripper joints explicitly synchronized to fully open. The demo moves the grasp center 2 cm in base +X and 2 mm in base -Z, preserving orientation. `examples/reach.json` is an equivalent fixed target for the default starting pose.

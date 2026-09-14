@@ -50,6 +50,7 @@ def box_clearances(centers, rotations, sizes, first, second):
 
 class Scene:
     def __init__(self, path: Path):
+        self.path = Path(path).resolve()
         self.model = mujoco.MjModel.from_xml_path(str(path))
         self.data = mujoco.MjData(self.model)
         m = self.model
@@ -106,7 +107,12 @@ class Scene:
     def require(self, kind, name):
         index = mujoco.mj_name2id(self.model, kind, name)
         if index < 0:
-            raise ValueError(f"Required model element is missing: {name}")
+            raise ValueError(
+                f"Required model element is missing: {name} (scene: {self.path}). "
+                "Generated models are Git-ignored and may be outdated. From the repository root, run "
+                "`python scripts/prepare_nero_mujoco.py` (without --no-gripper), then "
+                "`python scripts/build_nero_scene.py`. If using --scene, rebuild that custom scene too."
+            )
         return index
 
     def set_arm(self, q):
