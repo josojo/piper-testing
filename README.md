@@ -376,3 +376,31 @@ hard-coded Pose
 
 Only after this works should the validated trajectory be connected to `pyAgxArm`.
 
+## Preparing the MuJoCo environment
+
+The official NERO source is [AgileX's `agx_arm_urdf` repository](https://github.com/agilexrobotics/agx_arm_urdf). It provides the NERO URDF/Xacro files and meshes. The repository is fetched into an ignored directory; no vendor copy is committed here.
+
+Create an isolated environment and install the simulation dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-mujoco.txt
+```
+
+Fetch the official base URDF and rewrite its mesh paths for standalone MuJoCo loading:
+
+```bash
+python scripts/prepare_nero_mujoco.py
+python scripts/check_mujoco_model.py
+```
+
+The checker must report a loaded model and the NERO joint list. If the gripper Xacro is needed, install the ROS `xacro` command in the environment and run:
+
+```bash
+python scripts/prepare_nero_mujoco.py --xacro
+python scripts/check_mujoco_model.py
+```
+
+This is an offline model-loading milestone only. It does not connect to CAN or move the physical arm. After loading succeeds, the next step is to add an MJCF scene with a named end-effector site, conservative collision proxies, and a table before implementing IK and trajectory validation.

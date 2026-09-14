@@ -1,0 +1,4 @@
+# Offline NERO model loading and planning foundation.
+mujoco>=3.2,<4
+numpy>=1.24
+
