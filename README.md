@@ -410,6 +410,6 @@ python scripts/build_nero_scene.py
 python -m mujoco.viewer --mjcf=models/nero/nero_scene.xml
 ```
 
-The actuators are low-level position actuators for simulation inspection only; they are not connected to `pyAgxArm` and cannot move the physical arm. The viewer's control sliders can be used to pose the joints.
+The actuators are conservative position actuators for simulation inspection only; they are not connected to `pyAgxArm` and cannot move the physical arm. This inspection scene disables gravity and detailed-mesh collisions because the vendor URDF does not contain tuned dynamics. The table is visual for now; collision proxies will be added with the planner. The viewer's control sliders can be used to pose the joints.
 
 This is an offline model-loading milestone only. It does not connect to CAN or move the physical arm. After loading succeeds, the next step is to add an MJCF scene with a named end-effector site, conservative collision proxies, and a table before implementing IK and trajectory validation.

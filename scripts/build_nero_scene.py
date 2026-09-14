@@ -34,6 +34,27 @@ def build(model_path: Path, output_path: Path) -> None:
     if worldbody is None:
         raise RuntimeError("Compiled model has no worldbody")
 
+    # The vendor URDF is a kinematic/geometry description and has no tuned
+    # dynamic parameters. Use conservative inspection defaults until a proper
+    # NERO dynamics calibration is available.
+    option = root.find("option")
+    if option is None:
+        option = ET.Element("option")
+        root.insert(1, option)
+    option.set("gravity", "0 0 0")
+    option.set("timestep", "0.002")
+    for joint in worldbody.findall(".//joint"):
+        if joint.get("name") in JOINTS:
+            joint.set("damping", "5")
+            joint.set("armature", "0.05")
+
+    # Detailed imported collision meshes are not tuned for stable dynamics;
+    # leave them visual-only for this scene. Collision proxies will be added
+    # during the planning/collision-validation phase.
+    for geom in worldbody.findall(".//geom"):
+        geom.set("contype", "0")
+        geom.set("conaffinity", "0")
+
     ET.SubElement(worldbody, "geom", {
         "name": "table",
         "type": "box",
@@ -60,10 +81,10 @@ def build(model_path: Path, output_path: Path) -> None:
         ET.SubElement(actuators, "position", {
             "name": f"{joint_name}_position",
             "joint": joint_name,
-            "kp": "200",
-            "kv": "20",
+            "kp": "10",
+            "kv": "2",
             "ctrlrange": f"{lower:.8g} {upper:.8g}",
-            "forcerange": "-100 100",
+            "forcerange": "-20 20",
         })
 
     visual = ET.SubElement(root, "visual")
