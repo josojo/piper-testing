@@ -231,6 +231,26 @@ class Planner:
         return float(minimum), count
 
     def plan(self, target: Pose):
+        return self._plan(target)
+
+    def plan_joint_goal(self, joints, reason="Locally generated reachable pose"):
+        """Validate an exact joint goal, including its Cartesian step size.
+
+        Useful for known posture waypoints and returning to captured joints
+        without letting redundant-arm IK choose a different configuration.
+        """
+        goal = self._joints(joints)
+        saved_qpos, saved_qvel = self.scene.data.qpos.copy(), self.scene.data.qvel.copy()
+        try:
+            position, quat = self.scene.pose(goal)
+            target = Pose("nero_base", tuple(position), tuple(quat[[1, 2, 3, 0]]), reason=reason)
+        finally:
+            self.scene.data.qpos[:] = saved_qpos
+            self.scene.data.qvel[:] = saved_qvel
+            mujoco.mj_forward(self.scene.model, self.scene.data)
+        return self._plan(target, goal)
+
+    def _plan(self, target: Pose, joint_goal=None):
         if not isinstance(target, Pose):
             raise PlanningError("plan requires a validated Pose")
         if self.scene.fingerprint() != self._model_fingerprint:
@@ -248,7 +268,7 @@ class Planner:
             position, _ = self.scene.pose(start)
             if np.linalg.norm(np.asarray(target.position_m) - position) > self.limits.max_target_translation_m + 1e-12:
                 raise PlanningError("Target translation exceeds the per-request step limit")
-            goal = self._solve_ik(start, target)
+            goal = self._solve_ik(start, target) if joint_goal is None else joint_goal
             return self._validate(start, goal, target, state)
         finally:
             self.scene.data.qpos[:] = saved_qpos

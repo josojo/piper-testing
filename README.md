@@ -362,7 +362,7 @@ The simulator should make dangerous motions less likely. It cannot guarantee tha
 
 ## Current repository status
 
-The repository contains direct Python/CAN control and safety scripts, an official-URDF-derived NERO MuJoCo scene, and a simulation-only pose executor in `nero_planner`. The executor provides numerical IK, timed joint interpolation, conservative full-path collision/clearance validation, and kinematic playback. Camera/Astra integration and a hardware trajectory adapter are not implemented.
+The repository contains direct Python/CAN control and safety scripts, an official-URDF-derived NERO MuJoCo scene, and a simulation-only pose executor in `nero_planner`. The executor provides numerical IK, timed joint interpolation, conservative full-path collision/clearance validation, and kinematic playback. `nero_experiment` adds an experimental OpenRouter/Gemini upright-and-return workflow with read-only hardware capture and opt-in, monitored physical execution. Camera/Astra integration and calibrated dynamic trajectory tracking are not implemented.
 
 The implemented milestone is a simulation-only target executor:
 
@@ -491,4 +491,154 @@ python -m unittest discover -s tests -v
 
 This builds an isolated scene from the prepared URDF and tests successful reaching, mesh enclosure, tool/gripper conventions, table/apple/self-collision rejection, near misses without forbidden contacts, unsafe path interiors with safe endpoints, validation-budget exhaustion, pose/step/timing limits, malformed inputs, stale states/scenes, and modified trajectory rejection. It requires neither CAN nor a display. The root-level `test_nero.py`, `test_backend.py`, and related scripts are existing hardware utilities and are not part of this offline suite.
 
-Remaining milestones are hardware FK/TCP calibration, refined assembly collision models, dynamic tracking validation, supervised hardware integration, camera calibration, and Astra target selection.
+Remaining milestones are physical validation of the experimental adapter, hardware FK/TCP calibration, refined assembly collision models, dynamic tracking validation, camera calibration, and Astra target selection.
+
+## First OpenRouter experiment: upright and return
+
+`nero_experiment` implements this sequence:
+
+```text
+Capture all seven measured joint angles, motor/status and gripper feedback
+→ Generate small, reachable Cartesian pose options toward an upright reference
+→ Gemini selects the next pose using the task, initial observation and simulated state
+→ Validate the selected pose and its complete joint path, then simulate it
+→ Repeat until upright; validate and simulate the exact reverse joint path
+→ Optionally preview the whole round trip
+→ For --execute: check hardware motion envelopes and fresh measured state
+→ Operator types EXECUTE
+→ Small, slow move_j commands with feedback checks and settling after every move
+→ Verify return to the original measured joint configuration
+```
+
+**“Upright” means straightening the arm to a reviewed joint reference, not lifting the gripper along a vertical Cartesian line.** The simulation default is all seven joints at zero. Verify that reference on your NERO before physical use. If already at that reference, the experiment reports success without issuing motion or calling the LLM.
+
+The LLM is a pose selector. Local forward kinematics and path validation generate reachable choices; Gemini returns a candidate ID, its Cartesian coordinates, quaternion and a reason. Unknown candidates, changed coordinates, malformed JSON, refusals and exhausted retry budgets fail closed. This avoids depending on an LLM to invent geometrically reachable coordinates or solve redundant-arm IK. `Planner.plan_joint_goal` preserves the exact selected joint posture, including for the return leg.
+
+All LLM calls and round-trip simulation happen **before any physical motion**. The prompt explicitly distinguishes the initial measured observation from subsequent predicted simulation states. No claim is made that the arm was re-observed after each LLM call. The hardware must still match its captured starting state after planning, preview and confirmation. The return path is deterministic; faults stop execution instead of attempting an automatic return through an uncertain state.
+
+The default model is **`google/gemini-3.8-flash`**, verified against the [OpenRouter model catalog](https://openrouter.ai/api/v1/models). Requests use [strict structured outputs](https://openrouter.ai/docs/guides/features/structured-outputs), followed by independent local validation. `--model` overrides the ID; unsupported IDs or schema support are errors, with no model substitution. `OPENROUTER_API_KEY` is read from the process environment, never a committed file. Task text, arm state, candidate poses and validation metrics are sent to OpenRouter. No camera images are sent. The default outward budget is 64 steps with at most three LLM attempts per step; HTTP failures abort immediately. Each request has a 45-second timeout and a 4,096-token output cap. API usage is billable.
+
+### Setup on the Ubuntu machine connected to the arm
+
+From the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-hardware.txt
+python scripts/prepare_nero_mujoco.py
+python scripts/build_nero_scene.py
+python -m unittest discover -s tests -v
+mkdir -p reports
+```
+
+The hardware dependency pins `pyAgxArm==1.0.0`. Its aggregate joint getter can contain partially stale data; this adapter deliberately inspects all four constituent joint packets. Changing the SDK version requires reviewing that integration. The existing `nero_safety_common.py` selects NERO firmware `V121`; the actual controller firmware must match the reviewed setup.
+
+Configure the existing SocketCAN adapter as appropriate for your server. For the default `can0` at 1 Mbit/s:
+
+```bash
+sudo ip link set can0 up type can bitrate 1000000
+export NERO_CAN_INTERFACE=socketcan
+export NERO_CAN_CHANNEL=can0
+```
+
+Ensure `OPENROUTER_API_KEY` is exported in the shell that runs the experiment. Simulation alone needs only `requirements-mujoco.txt`. Use the offline smoke test first; it neither connects to CAN nor calls OpenRouter:
+
+```bash
+python -m nero_experiment run --offline-demo --output reports/offline.json
+```
+
+This uses a slightly bent simulated arm, four outward steps and four return steps. Add `--viewer` for continuous visual playback, including a short pause at upright. Ubuntu needs a working display for the viewer; on macOS use `.venv/bin/mjpython -m nero_experiment ... --viewer`. All other commands can run headlessly over SSH.
+
+### Capture state and test Gemini without movement
+
+The modeled AGX gripper must be installed, empty and fully open. The current adapter requires width-mode feedback at **0.100 m ± 0.001 m**. Missing/closed gripper feedback is rejected; it does not open the gripper for you. A different tool requires updating the model and adapter.
+
+Capture a stationary state without enabling, resetting, disabling or moving the arm:
+
+```bash
+python -m nero_experiment capture --output reports/start.json
+```
+
+Test Gemini and the complete simulation from that saved state:
+
+```bash
+python -m nero_experiment run \
+  --start reports/start.json \
+  --output reports/gemini-simulation.json
+```
+
+Or capture fresh hardware feedback and simulate in one command:
+
+```bash
+python -m nero_experiment run \
+  --read-hardware \
+  --output reports/live-state-simulation.json
+```
+
+These commands issue no motion commands. They also do not auto-enable the arm. Healthy, disabled joints can be captured; physical execution requires all seven joints already enabled and the controller reporting NORMAL. Standby/CAN control modes are supported; teaching and other control sources are rejected. For simulation with another known upright reference, supply `--upright path.json` containing seven joint angles in radians.
+
+Successful reports contain `status: "simulation_passed"`, a `scene_fingerprint`, every LLM decision, the captured state and all simulated trajectories. These files are reports, **not executable trajectory approvals**. Hardware execution always captures and plans anew in the same process. Simulation success does not imply hardware envelope checks will pass.
+
+### Review the physical setup before --execute
+
+Copy the example configuration:
+
+```bash
+cp examples/upright-hardware.example.json upright-hardware.local.json
+```
+
+Complete its fields after checking the actual installation:
+
+- `scene_fingerprint`: copy from the dry run **after** reviewing the scene against the real table, robot mount, tool, payload and obstacles. The default scene includes an example table/apple; it does not observe your surroundings. Rebuild and review when geometry changes.
+- `upright_joints_rad`: a verified upright posture in SDK joint order/radians. Check joint signs, zero offsets and the model against measurements at multiple configurations; all-zero is an initial model convention.
+- `flange_position_in_link7_m` and `flange_orientation_in_link7_xyzw`: the calibrated transform from the model's `link7` frame to the SDK-reported flange frame. The example identity transform is a placeholder, not a calibration. The adapter compares model and measured flange poses before movement and after every settled microstep, rejecting differences above 5 mm or 3 degrees. Agreement at one pose is not sufficient calibration.
+- The six verification booleans must reflect completed checks: firmware, joint conventions, upright reference, tool/scene, tested physical emergency stop and empty gripper. Strings such as `"true"` are rejected. Review the documented structural collision exclusions; they still apply.
+
+Keep the workspace clear, supervise the first experiment and have the physical emergency stop accessible. Manually enable the supported arm through your established procedure. This program preserves motor enable state on normal exit and sends an electronic emergency stop on an execution fault; it does not reset faults or automatically disable motors, which could release the arm.
+
+First include the reviewed configuration in a dry run. This also checks calibration and all independent-joint motion envelopes:
+
+```bash
+python -m nero_experiment run \
+  --read-hardware \
+  --hardware-config upright-hardware.local.json \
+  --output reports/hardware-preflight.json
+```
+
+Then explicitly request physical execution:
+
+```bash
+python -m nero_experiment run \
+  --read-hardware \
+  --hardware-config upright-hardware.local.json \
+  --execute \
+  --output reports/execution.json
+```
+
+The operator must type `EXECUTE` after successful simulation and preflight. Any other response cancels. The state is checked again after that prompt. There is no noninteractive bypass; `--offline-demo` cannot be combined with physical execution.
+
+### Execution bounds and limitations
+
+| Check | Initial experiment setting |
+| --- | --- |
+| LLM-selected joint/Cartesian step | At most 0.08 rad per joint / 0.03 m |
+| Simulated velocity / acceleration | 0.08 rad/s / 0.15 rad/s² |
+| Maximum start-to-upright joint excursion | 3 rad per joint |
+| Controller speed setting | 3% |
+| Nominal hardware microstep | At most 0.005 rad per joint |
+| Hardware start mismatch | At most 0.001 rad |
+| Position tolerance for settling | 0.0005 rad for at least 0.3 s |
+| Certified tracking envelope | Endpoint joint bounds expanded by 0.002 rad |
+| Required collision clearance | 0.03 m throughout each checked envelope |
+| Joint packet age / inter-packet skew | At most 50 ms / 20 ms |
+| Other feedback packet age / overall skew | At most 250 ms / 150 ms |
+| Motor velocity trip threshold | 0.10 rad/s; joint finite-difference cross-check at 0.11 rad/s |
+| Polling period | 20 ms, subject to OS and SDK scheduling |
+| Per-microstep / whole execution timeout | At least 5 s per step / 1,200 s overall |
+
+`move_j` performs controller-side interpolation, not the exact quintic timing seen in simulation. Therefore the adapter certifies a whole joint-angle box for each microstep, including a tracking margin: every combination of joint positions within that box has the required modeled clearance. This accounts for differing joint timing. Conservative geometry-motion bounds can reject a move even when a line-path simulation passes; do not bypass that rejection by reducing clearances without reviewing the model.
+
+The monitor checks fresh joint, motor, driver, gripper and arm-status feedback; bounds joint position and measured speed; and waits for measured arrival, not just an idle flag. A fault, timeout, stale packet, tracking deviation or Ctrl-C during execution triggers a best-effort electronic stop and cancels the remaining outward/return commands. Reports record the measured state and goal before each command and the achieved state after settling; an aborted report explicitly indicates that physical motion may have occurred.
+
+This Python process is not a real-time safety controller. Polling can miss between-sample deviations, CAN/software stops can fail, and process termination or power loss can prevent cleanup. The simulator does not validate real acceleration, stopping distance, payload dynamics or controller tracking. Full extension can be singular; a controller singularity status aborts the experiment rather than forcing the last move. Physical validation, refined collision exclusions and an independent stop remain necessary. The adapter has been tested with fake feedback offline, not on a physical NERO.

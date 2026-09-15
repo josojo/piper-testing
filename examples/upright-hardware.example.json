@@ -1,0 +1,12 @@
+{
+  "scene_fingerprint": "REPLACE_WITH_FINGERPRINT_FROM_YOUR_REVIEWED_DRY_RUN",
+  "firmware_v121_verified": false,
+  "joint_conventions_verified": false,
+  "upright_reference_verified": false,
+  "tool_and_scene_verified": false,
+  "physical_estop_tested": false,
+  "empty_gripper_verified": false,
+  "upright_joints_rad": [0, 0, 0, 0, 0, 0, 0],
+  "flange_position_in_link7_m": [0, 0, 0],
+  "flange_orientation_in_link7_xyzw": [0, 0, 0, 1]
+}

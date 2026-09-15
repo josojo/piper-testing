@@ -93,6 +93,37 @@ class Scene:
                 continue
             self.pairs.append((a, b))
         self.first, self.second = np.array(self.pairs, dtype=int).T
+        # A rotation shared by both boxes preserves their separation. Only
+        # joints in one box's ancestry but not the other's affect pair distance.
+        ancestry = np.zeros((m.ngeom, 7), dtype=bool)
+        joint_bodies = list(m.jnt_bodyid[ids])
+        for geom_id in collision_ids:
+            body = int(m.geom_bodyid[geom_id])
+            while body:
+                if body in joint_bodies:
+                    ancestry[geom_id, joint_bodies.index(body)] = True
+                body = int(m.body_parentid[body])
+        self.pair_joint_influence = ancestry[self.first] ^ ancestry[self.second]
+        radii = np.zeros((m.ngeom, 7))
+        for geom_id in collision_ids:
+            body = int(m.geom_bodyid[geom_id])
+            distance = float(np.linalg.norm(m.geom_pos[geom_id]) + np.linalg.norm(m.geom_size[geom_id]))
+            while body:
+                if body in joint_bodies:
+                    column = joint_bodies.index(body)
+                    radii[geom_id, column] = distance + np.linalg.norm(m.jnt_pos[ids[column]])
+                # Include the maximum translation of fixed-open gripper slides.
+                for jid in range(m.body_jntadr[body], m.body_jntadr[body] + m.body_jntnum[body]):
+                    if m.jnt_type[jid] == mujoco.mjtJoint.mjJNT_SLIDE:
+                        distance += max(abs(m.jnt_range[jid]))
+                    elif m.jnt_type[jid] == mujoco.mjtJoint.mjJNT_HINGE:
+                        # A descendant hinge away from its body origin can
+                        # translate that origin by up to twice its anchor offset.
+                        distance += 2 * float(np.linalg.norm(m.jnt_pos[jid]))
+                distance += float(np.linalg.norm(m.body_pos[body]))
+                body = int(m.body_parentid[body])
+        self.pair_motion_radii = np.where(ancestry[self.first], radii[self.first], radii[self.second])
+        self.pair_motion_radii *= self.pair_joint_influence
         # Any robot point is at most R from any ancestor hinge. This loose
         # global bound includes all fixed translations, anchor offsets, box
         # radii and possible prismatic offsets. Rotation preserves lengths.
@@ -132,6 +163,18 @@ class Scene:
         quat = np.empty(4)
         mujoco.mju_mat2Quat(quat, self.data.site_xmat[self.site])
         return self.data.site_xpos[self.site].copy(), quat
+
+    def joint_box_clearance(self, lower, upper):
+        """Conservative clearance throughout an independent-joint envelope.
+
+        Unlike straight-path validation, this permits different joint timing
+        within the box. R bounds any affected point's distance from its hinge;
+        sum(R * angle_change) bounds the possible loss of separation.
+        """
+        lower, upper = np.asarray(lower), np.asarray(upper)
+        distances = self.distances((lower + upper) / 2)
+        loss = self.pair_motion_radii @ ((upper - lower) / 2)
+        return float(np.min(distances - loss))
 
     def fingerprint(self):
         """Hash model state that can affect geometry, kinematics or policy."""

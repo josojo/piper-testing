@@ -59,7 +59,16 @@ def add_planning_geometry(root: ET.Element, model: mujoco.MjModel) -> None:
         "quat": bodies["gripper_link"].get("quat", "1 0 0 0"), "size": "0.006",
         "rgba": "0 1 0 1", "group": "0",
     })
-    equality = ET.SubElement(root, "equality")
+    # Recent MuJoCo versions import URDF mimic joints as equality constraints.
+    # Replace those finger constraints instead of adding duplicates (older
+    # releases did not import them). Keep unrelated vendor constraints.
+    equality = root.find("equality")
+    if equality is None:
+        equality = ET.SubElement(root, "equality")
+    for section in root.findall("equality"):
+        for constraint in list(section):
+            if constraint.tag == "joint" and constraint.get("joint1") in {"gripper_joint1", "gripper_joint2"}:
+                section.remove(constraint)
     for name, multiplier in (("gripper_joint1", 0.5), ("gripper_joint2", -0.5)):
         ET.SubElement(equality, "joint", {
             "joint1": name, "joint2": "gripper", "polycoef": f"0 {multiplier} 0 0 0",
