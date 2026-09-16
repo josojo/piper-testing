@@ -1,6 +1,9 @@
 """Plan a complete bounded upright-and-return experiment before execution."""
 
+from __future__ import annotations
+
 from dataclasses import asdict, dataclass
+import math
 import time
 
 import numpy as np
@@ -11,8 +14,9 @@ from nero_planner.planner import vector
 from .openrouter import validate_selection
 
 
-EXPERIMENT_LIMITS = Limits(max_velocity_rad_s=0.08, max_acceleration_rad_s2=0.15,
-                          max_joint_displacement_rad=0.08, max_target_translation_m=0.03)
+EXPERIMENT_LIMITS = Limits(minimum_clearance_m=0.005, max_velocity_rad_s=0.08,
+                          max_acceleration_rad_s2=0.15, max_duration_s=30.0,
+                          max_joint_displacement_rad=1.0, max_target_translation_m=0.5)
 DEMO_START = (0.0, -0.15, 0.0, 0.30, 0.0, -0.15, 0.0)
 UPRIGHT = (0.0,) * 7
 
@@ -26,6 +30,7 @@ class Candidate:
     def to_prompt(self):
         pose = asdict(self.trajectory.source_target_pose)
         pose.pop("reason")
+        pose.pop("gripper")
         return {"id": self.id, "target": pose,
                 "remaining_joint_error_rad": self.remaining_joint_error_rad,
                 "validation": asdict(self.trajectory.validation),
@@ -55,18 +60,26 @@ class ExperimentPlan:
                 "note": "Report only; cannot be loaded as authorization to move hardware."}
 
 
-def reachable_candidates(planner, upright):
+def reachable_candidates(planner, upright, remaining_steps=3):
     current = planner.scene.data.qpos[planner.scene.qadr].copy()
     delta = np.asarray(upright) - current
     distance = float(np.max(np.abs(delta)))
     if distance <= 1e-9:
         return []
+    max_step = planner.limits.max_joint_displacement_rad
+    minimum_step = max(0.0, distance - (remaining_steps - 1) * max_step)
+    largest_step = min(distance, max_step)
+    if minimum_step > largest_step + 1e-12:
+        raise PlanningError(f"Cannot reach upright within {remaining_steps} pose requests at the configured joint-step limit")
+    step_sizes = sorted({largest_step,
+                         max(minimum_step, largest_step * 0.75),
+                         max(minimum_step, largest_step * 0.5),
+                         max(minimum_step, largest_step * 0.25)}, reverse=True)
     result = []
-    fractions = sorted({min(1.0, step / distance) for step in (0.08, 0.04, 0.02, 0.01)}, reverse=True)
-    for fraction in fractions:
-        goal = current + fraction * delta
+    for step in step_sizes:
+        goal = current + (step / distance) * delta
         try:
-            trajectory = planner.plan_joint_goal(goal, "Small step toward the upright joint reference")
+            trajectory = planner.plan_joint_goal(goal, "Slow, validated waypoint toward the upright joint reference")
         except PlanningError:
             continue
         result.append(Candidate(f"candidate_{len(result) + 1}", trajectory,
@@ -77,11 +90,17 @@ def reachable_candidates(planner, upright):
 
 
 def plan_experiment(planner: Planner, start, chooser, upright=UPRIGHT, captured_state=None,
-                    max_steps=64, progress=lambda message: None):
+                    max_steps=3, progress=lambda message: None):
     start = vector(start, 7, "start")
     upright = vector(upright, 7, "upright")
+    if not 1 <= max_steps <= 64:
+        raise PlanningError("max-steps must be between 1 and 64")
     if np.max(np.abs(upright - start)) > 3.0:
         raise PlanningError("Initial experiment exceeds the 3 rad per-joint total excursion budget")
+    required_steps = math.ceil(float(np.max(np.abs(upright - start))) /
+                               planner.limits.max_joint_displacement_rad - 1e-12)
+    if required_steps > max_steps:
+        raise PlanningError(f"Upright posture needs at least {required_steps} pose requests at the configured joint-step limit")
     original_state = captured_state or {"source": "simulation", "joints_rad": start.tolist()}
     planner.set_start(upright)
     # Both endpoints must be valid even before paying for LLM requests.
@@ -94,14 +113,16 @@ def plan_experiment(planner: Planner, start, chooser, upright=UPRIGHT, captured_
         while np.max(np.abs(planner.scene.data.qpos[planner.scene.qadr] - upright)) > 1e-9:
             if len(segments) >= max_steps:
                 raise PlanningError("Upright planning exceeded its step/API request budget")
-            candidates = reachable_candidates(planner, upright)
+            remaining_steps = max_steps - len(segments)
+            candidates = reachable_candidates(planner, upright, remaining_steps)
             context = {
                 "task": "Straighten the arm upright, then move slowly back to the original joint configuration",
                 "initial_observation": original_state,
                 "current_state_source": "simulation_predicted_from_initial_observation",
                 "current_joints_rad": planner.scene.data.qpos[planner.scene.qadr].tolist(),
-                "current_grasp_pose": asdict(planner.current_pose()),
+                "current_tool_pose": asdict(planner.current_pose()),
                 "upright_joints_rad": upright.tolist(), "original_joints_rad": start.tolist(),
+                "pose_requests_remaining": remaining_steps,
                 "joint_names": list(JOINT_NAMES),
                 "joint_limits_rad": planner.scene.ranges.tolist(),
                 "limits": asdict(planner.limits),

@@ -233,6 +233,13 @@ class PlannerTests(unittest.TestCase):
             with self.assertRaises(PlanningError):
                 self.planner.set_start(q)
 
+    def test_joint_limit_error_names_every_out_of_range_joint(self):
+        q = np.zeros(7)
+        q[1] = self.planner.scene.ranges[1, 0] - 0.02
+        q[2] = self.planner.scene.ranges[2, 1] + 0.03
+        with self.assertRaisesRegex(PlanningError, r"joint2=.*outside.*joint3=.*outside"):
+            self.planner.set_start(q)
+
     def test_duration_and_motion_limits(self):
         target = self.target()
         self.planner.limits = replace(Limits(), max_duration_s=0.01)

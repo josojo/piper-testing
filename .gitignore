@@ -3,6 +3,7 @@ __pycache__/
 /venv/
 .venv/
 __pycache__/
+reports/
 models/official/
 models/nero/
 models/*.expanded.urdf

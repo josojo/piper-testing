@@ -3,15 +3,18 @@
 from dataclasses import asdict
 import json
 import os
+from pathlib import Path
+import socket
 import urllib.error
 import urllib.request
 
 import numpy as np
+from dotenv import load_dotenv
 
 from nero_planner import PlanningError, Pose
 
 
-DEFAULT_MODEL = "google/gemini-3.8-flash"
+DEFAULT_MODEL = "gpt-5.6-luna"
 ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
 
@@ -41,10 +44,9 @@ def response_schema(candidate_ids):
             "candidate_id": {"type": "string", "enum": [*candidate_ids, "stop"]},
             "target": {"anyOf": [{"type": "null"}, {
                 "type": "object", "additionalProperties": False,
-                "required": ["frame", "position_m", "orientation_xyzw", "gripper"],
+                "required": ["frame", "position_m", "orientation_xyzw"],
                 "properties": {"frame": {"type": "string", "enum": ["nero_base"]},
-                               "position_m": array(3), "orientation_xyzw": array(4),
-                               "gripper": {"type": "number", "enum": [1.0]}},
+                               "position_m": array(3), "orientation_xyzw": array(4)},
             }]},
             "reason": {"type": "string"},
         },
@@ -74,8 +76,10 @@ def validate_selection(value, candidates):
 
 
 class OpenRouter:
-    def __init__(self, model=DEFAULT_MODEL, api_key=None, timeout=45, transport=None):
+    def __init__(self, model=DEFAULT_MODEL, api_key=None, timeout=60, transport=None):
         self.model = model
+        # Load the project-root .env while preserving any explicit shell values.
+        load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
         if not self.api_key:
             raise RuntimeError("Set OPENROUTER_API_KEY in the environment on the machine running this command")
@@ -87,11 +91,13 @@ class OpenRouter:
             "model": self.model,
             "messages": [
                 {"role": "system", "content": (
-                    "You select the next small Cartesian pose for a supervised seven-joint NERO experiment. "
+                    "You select the next locally validated Cartesian waypoint for a supervised seven-joint NERO experiment. "
                     "The task is to straighten the arm toward the supplied upright joint reference, then "
                     "return slowly to the original joint configuration. Only choose from the supplied "
                     "locally reachable, full-path validated candidates. Copy its ID and pose coordinates "
-                    "exactly. Prefer useful progress with good clearance. Never invent coordinates, "
+                    "exactly. Prefer the greatest joint progress that remains feasible within the "
+                    "remaining pose-request budget, with good clearance. These waypoints are executed "
+                    "as slow, small hardware microsteps. Never invent coordinates, "
                     "joint commands, settings, or claim hardware safety. Choose stop with target=null "
                     "if the task cannot be supported. State data after the initial capture are predicted "
                     "simulation states, not new hardware observations. A deterministic reverse path "
@@ -119,8 +125,9 @@ class OpenRouter:
         except urllib.error.HTTPError as error:
             # Avoid echoing provider bodies or authentication headers into logs.
             raise RuntimeError(f"OpenRouter HTTP {error.code}; check model ID, credentials, credits and schema support") from None
-        except (urllib.error.URLError, TimeoutError):
-            raise RuntimeError("OpenRouter request failed or timed out; no motion approved") from None
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as error:
+            detail = "timed out" if isinstance(error, (socket.timeout, TimeoutError)) else "failed"
+            raise RuntimeError(f"OpenRouter request {detail} after {self.timeout:g}s; no motion approved") from None
         if len(body) > 1_000_000:
             raise PlanningError("OpenRouter response exceeded size limit")
         try:

@@ -6,9 +6,9 @@ This is experimental software, not a real-time or safety-rated controller.
 """
 
 from contextlib import contextmanager
+from collections import deque
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
-from importlib.metadata import version
 import math
 import time
 
@@ -17,6 +17,8 @@ import numpy as np
 
 from nero_planner import PlanningError, Pose
 from nero_planner.planner import vector
+from .sdk_compat import (acceleration_counts, check_sdk_revision,
+                         read_joint_acceleration, write_joint_acceleration)
 
 
 @dataclass(frozen=True)
@@ -27,19 +29,23 @@ class HardwareConfig:
     upright_reference_verified: bool
     tool_and_scene_verified: bool
     physical_estop_tested: bool
-    empty_gripper_verified: bool
     upright_joints_rad: tuple
     flange_position_in_link7_m: tuple
     flange_orientation_in_link7_xyzw: tuple
 
     @classmethod
     def from_dict(cls, value):
+        # Accept the old example/local config shape after removing its gripper gate.
+        if not isinstance(value, dict):
+            raise PlanningError("Hardware config must be a JSON object")
+        value = dict(value)
+        value.pop("empty_gripper_verified", None)
         try:
             config = cls(**value)
         except (TypeError, ValueError):
             raise PlanningError("Hardware config is incomplete or contains unknown fields") from None
         for name in ("firmware_v121_verified", "joint_conventions_verified", "upright_reference_verified",
-                     "tool_and_scene_verified", "physical_estop_tested", "empty_gripper_verified"):
+                     "tool_and_scene_verified", "physical_estop_tested"):
             if getattr(config, name) is not True:
                 raise PlanningError(f"Hardware configuration requires a completed physical check: {name}")
         upright = vector(config.upright_joints_rad, 7, "upright_joints_rad")
@@ -58,7 +64,6 @@ class ArmState:
     enabled: tuple
     arm_status: int
     motion_status: int
-    gripper_width_m: float
     flange_pose_m_rad: tuple
     feedback_timestamps: tuple
     captured_at_unix: float
@@ -72,15 +77,56 @@ MAX_FEEDBACK_SKEW_S = 0.15
 START_MATCH_RAD = 0.001
 SETTLE_TOLERANCE_RAD = 0.0005
 TRACKING_ENVELOPE_RAD = 0.002
-MICROSTEP_RAD = 0.005
+MICROSTEP_RAD = 0.002
 MAX_MEASURED_VELOCITY_RAD_S = 0.10
-SPEED_PERCENT = 3
+SPEED_PERCENT = 1
+MAX_CONTROLLER_ACCELERATION_RAD_S2 = 0.15
+VELOCITY_HISTORY_SAMPLES = 26  # About 0.5 s at the nominal 20 ms polling interval.
+
+
+class VelocityLimitError(PlanningError):
+    """Keep feedback in memory until execute has attempted the emergency stop."""
+
+    def __init__(self, reason, diagnostic):
+        super().__init__(reason)
+        self.diagnostic = diagnostic
+
+
+class JointFeedbackTimingError(PlanningError):
+    """A snapshot failed the joint age/skew limits; never use its positions."""
 
 
 class NeroHardware:
-    def __init__(self, robot, gripper, clock=time.monotonic, wall_clock=time.time, sleep=time.sleep):
-        self.robot, self.gripper = robot, gripper
+    def __init__(self, robot, clock=time.monotonic, wall_clock=time.time, sleep=time.sleep):
+        self.robot = robot
         self.clock, self.wall_clock, self.sleep = clock, wall_clock, sleep
+
+    def configure_acceleration(self, maximum=MAX_CONTROLLER_ACCELERATION_RAD_S2, record=lambda event: None):
+        """Lower limits without motion; never restore higher limits automatically."""
+        maximum = min(maximum, MAX_CONTROLLER_ACCELERATION_RAD_S2)
+        cap = acceleration_counts(maximum) / 100
+        firmware = self.robot.get_firmware()
+        if not isinstance(firmware, dict) or firmware.get("software_version") != "1.21":
+            raise PlanningError("The acceleration compatibility fix requires confirmed NERO firmware 1.21")
+        self.stationary()
+        # Read every original value before making any changes.
+        original = [read_joint_acceleration(self.robot, j, self.wall_clock) for j in range(1, 8)]
+        targets = [acceleration_counts(min(value, cap)) / 100 for value in original]
+        record({"event": "controller_acceleration_pending", "firmware": firmware,
+                "previous_rad_s2": original, "requested_rad_s2": targets,
+                "limits_retained_after_execution": True})
+        self.stationary()
+        for joint, (before, target) in enumerate(zip(original, targets), 1):
+            if not math.isclose(before, target, abs_tol=1e-9, rel_tol=0):
+                write_joint_acceleration(self.robot, joint, target, self.wall_clock, self.clock, self.sleep)
+            record({"event": "joint_acceleration_verified", "joint": joint,
+                    "previous_rad_s2": before, "applied_rad_s2": target})
+        # Final independent fresh read of all seven joints before permitting motion.
+        actual = [read_joint_acceleration(self.robot, j, self.wall_clock) for j in range(1, 8)]
+        if any(not math.isclose(a, b, abs_tol=1e-9, rel_tol=0) for a, b in zip(actual, targets)):
+            raise PlanningError("Controller acceleration limits changed during setup; motion prohibited")
+        record({"event": "controller_acceleration_configured", "applied_rad_s2": actual})
+        return actual
 
     def read(self, require_enabled=False):
         timestamps = []
@@ -107,8 +153,7 @@ class NeroHardware:
             packet = fresh(getattr(parser, packet_name, None), packet_name)
             q.extend(getattr(packet, f"joint_{index}") for index in indices)
         q = vector(q, 7, "measured joints")
-        if max(timestamps) - min(timestamps) > 0.02 or self.wall_clock() - min(timestamps) > 0.05:
-            raise PlanningError("Joint position packets must be within 20 ms of each other and at most 50 ms old")
+        joint_timestamps = tuple(timestamps)
         status = fresh(self.robot.get_arm_status(), "arm status")
         state_code = int(status.arm_status)
         if state_code not in (0, 6) or status.err_code != 0:
@@ -129,14 +174,6 @@ class NeroHardware:
         velocities = vector(velocities, 7, "measured velocities")
         if require_enabled and (state_code != 0 or not all(enabled)):
             raise PlanningError("All joints must already be enabled and NORMAL; this experiment never auto-enables")
-        grip = fresh(self.gripper.get_gripper_status(), "gripper")
-        width = float(grip.value)
-        if grip.mode != "width" or not math.isfinite(width) or abs(width - 0.1) > 0.001:
-            raise PlanningError("The modeled AGX gripper must report fully open width 0.100 m (+/- 0.001 m)")
-        for flag in ("voltage_too_low", "motor_overheating", "driver_overcurrent", "driver_overheating",
-                     "sensor_status", "driver_error_status", "homing_status"):
-            if getattr(grip.foc_status, flag):
-                raise PlanningError(f"Gripper fault: {flag}")
         # Require all three constituent flange packets as well.
         for name in ("end_pose_xy", "end_pose_zrx", "end_pose_ryrz"):
             fresh(getattr(parser, name, None), name)
@@ -144,14 +181,32 @@ class NeroHardware:
         flange = vector(flange, 6, "measured flange pose")
         if max(timestamps) - min(timestamps) > MAX_FEEDBACK_SKEW_S:
             raise PlanningError("Feedback packet timestamps are too far apart")
+        # Check at the end so driver/controller faults take precedence and time
+        # spent gathering other feedback counts toward snapshot age.
+        ages = [self.wall_clock() - stamp for stamp in joint_timestamps]
+        skew = max(joint_timestamps) - min(joint_timestamps)
+        if skew > 0.02 or max(ages) > 0.05:
+            detail = ", ".join(f"{name}={age * 1000:.1f} ms" for name, age in
+                               zip(("joint_12", "joint_34", "joint_56", "joint_7"), ages))
+            raise JointFeedbackTimingError(
+                f"Joint feedback timing rejected: skew={skew * 1000:.1f} ms (limit 20 ms); "
+                f"ages [{detail}] (limit 50 ms)")
         return ArmState(tuple(q), tuple(velocities), tuple(enabled), state_code, int(status.motion_status),
-                        width, tuple(flange), tuple(timestamps), self.wall_clock())
+                        tuple(flange), tuple(timestamps), self.wall_clock())
 
     def stationary(self, require_enabled=False, timeout=5.0):
         deadline, stable_since, first = self.clock() + timeout, None, None
         last_error = "Arm has not settled"
         while self.clock() < deadline:
-            state = self.read(require_enabled)
+            try:
+                state = self.read(require_enabled)
+            except JointFeedbackTimingError as error:
+                # Only before commands / after a previously settled move.
+                # A rejected snapshot cannot contribute to the settling dwell.
+                stable_since, first = None, None
+                last_error = str(error)
+                self.sleep(0.005)
+                continue
             q = np.asarray(state.joints_rad)
             if state.motion_status == 0 and max(abs(v) for v in state.velocities_rad_s) <= 0.01:
                 if first is None or np.max(np.abs(q - first)) > SETTLE_TOLERANCE_RAD:
@@ -191,18 +246,38 @@ class NeroHardware:
         record({"event": "command_pending", "before": before.to_dict(), "goal_joints_rad": goal.tolist()})
         # Report I/O can block. Refresh once more immediately before the write
         # to CAN rather than assuming the pre-log observation is still current.
-        latest = self.read(require_enabled=True)
+        latest = self.stationary(require_enabled=True)
         if (latest.motion_status != 0 or max(abs(v) for v in latest.velocities_rad_s) > 0.01
                 or np.max(np.abs(np.asarray(latest.joints_rad) - start)) > SETTLE_TOLERANCE_RAD):
             raise PlanningError("Arm changed before the motion command; abort and re-plan")
+        previous = latest
+        began = self.clock()
+        samples = deque([latest], maxlen=VELOCITY_HISTORY_SAMPLES)
+
+        def velocity_failure(reason, source, joint, velocity, limit):
+            return VelocityLimitError(reason, {
+                "event": "velocity_limit_exceeded", "reason": reason,
+                "source": source, "joint": joint, "velocity_rad_s": float(velocity),
+                "limit_rad_s": limit, "goal_joints_rad": goal.tolist(),
+                "elapsed_since_command_s": self.clock() - began,
+                "samples": tuple(samples),
+            })
+
         self.robot.move_j(goal.tolist())
         while self.clock() - began < max(5.0, minimum_duration + 2.0):
             state = self.read(require_enabled=True)
+            samples.append(state)
             q = np.asarray(state.joints_rad)
             if np.any(q < lower) or np.any(q > upper):
                 raise PlanningError("Measured joints left the certified motion envelope")
-            if max(abs(v) for v in state.velocities_rad_s) > MAX_MEASURED_VELOCITY_RAD_S:
-                raise PlanningError("Measured motor velocity exceeded experiment limit")
+            motor_speed = max(abs(v) for v in state.velocities_rad_s)
+            if motor_speed > MAX_MEASURED_VELOCITY_RAD_S:
+                joint = 1 + max(range(7), key=lambda i: abs(state.velocities_rad_s[i]))
+                reason = (f"Measured motor velocity exceeded experiment limit: joint {joint} "
+                                    f"{state.velocities_rad_s[joint - 1]:.4f} rad/s > "
+                                    f"{MAX_MEASURED_VELOCITY_RAD_S:.4f} rad/s")
+                raise velocity_failure(reason, "motor_feedback", joint,
+                                       state.velocities_rad_s[joint - 1], MAX_MEASURED_VELOCITY_RAD_S)
             # Also estimate velocity from the joint packets, independently of
             # the firmware motor-velocity field. Require each group to advance.
             for index, packet_index in enumerate((0, 0, 1, 1, 2, 2, 3)):
@@ -210,7 +285,11 @@ class NeroHardware:
                 if dt > 0:
                     speed = abs(q[index] - previous.joints_rad[index]) / dt
                     if speed > MAX_MEASURED_VELOCITY_RAD_S + 0.01:
-                        raise PlanningError("Measured joint velocity exceeded experiment limit")
+                        reason = (f"Measured joint velocity exceeded experiment limit: joint {index + 1} "
+                                            f"{speed:.4f} rad/s > "
+                                            f"{MAX_MEASURED_VELOCITY_RAD_S + 0.01:.4f} rad/s")
+                        raise velocity_failure(reason, "joint_finite_difference", index + 1,
+                                               speed, MAX_MEASURED_VELOCITY_RAD_S + 0.01)
             previous = state
             reached = np.max(np.abs(q - goal)) <= SETTLE_TOLERANCE_RAD
             stationary = state.motion_status == 0 and max(abs(v) for v in state.velocities_rad_s) <= 0.01
@@ -301,7 +380,10 @@ def execute(planner, plan, hardware, config, confirm, progress=lambda message: N
         raise PlanningError("Arm moved during LLM planning/preview; capture again and re-plan")
     if not schedule:
         return state
-    if not confirm(f"Simulation and {len(schedule)} hardware envelopes passed. Type EXECUTE to move at {SPEED_PERCENT}% speed: "):
+    acceleration_cap = min(planner.limits.max_acceleration_rad_s2, MAX_CONTROLLER_ACCELERATION_RAD_S2)
+    if not confirm(f"Simulation and {len(schedule)} hardware envelopes passed. Type EXECUTE to apply "
+                   f"a {acceleration_cap:g} rad/s² acceleration cap (retained afterward) "
+                   f"and move at {SPEED_PERCENT}% speed: "):
         raise PlanningError("Physical execution cancelled")
     # This guard is before speed or motion writes. Repeat after the prompt.
     state = hardware.stationary(require_enabled=True)
@@ -310,6 +392,11 @@ def execute(planner, plan, hardware, config, confirm, progress=lambda message: N
         raise PlanningError("Arm changed while awaiting confirmation; re-plan")
     started = hardware.clock()
     try:
+        applied = hardware.configure_acceleration(acceleration_cap, record)
+        progress(f"Verified controller acceleration limits: {applied} rad/s²")
+        state = hardware.stationary(require_enabled=True)
+        if np.max(np.abs(np.asarray(state.joints_rad) - plan.original_joints)) > START_MATCH_RAD:
+            raise PlanningError("Arm changed during acceleration setup; re-plan")
         hardware.robot.set_speed_percent(SPEED_PERCENT)
         for index, (start, goal, duration) in enumerate(schedule):
             if hardware.clock() - started > 1200:
@@ -327,6 +414,15 @@ def execute(planner, plan, hardware, config, confirm, progress=lambda message: N
             hardware.stop()
         except Exception:
             raise RuntimeError("Execution failed AND the electronic stop could not be sent; use the physical emergency stop") from error
+        finally:
+            if isinstance(error, VelocityLimitError):
+                # Serialization and report I/O must never delay the stop attempt
+                # or obscure its failure. No per-sample disk writes in motion.
+                try:
+                    record({**error.diagnostic,
+                            "samples": [state.to_dict() for state in error.diagnostic["samples"]]})
+                except Exception:
+                    pass  # Preserve the motion/stop error if reporting fails.
         raise
 
 
@@ -334,12 +430,10 @@ def execute(planner, plan, hardware, config, confirm, progress=lambda message: N
 def connect():
     # Reading and offline imports never load pyAgxArm. Private packet access is
     # pinned to the SDK whose aggregate-feedback behavior was inspected.
-    if version("pyAgxArm") != "1.0.0":
-        raise PlanningError("This adapter requires pyAgxArm==1.0.0; review packet access before changing versions")
+    check_sdk_revision()
     from nero_safety_common import connect_nero, disconnect_nero
     robot = connect_nero()
     try:
-        gripper = robot.init_effector("agx_gripper")
-        yield NeroHardware(robot, gripper)
+        yield NeroHardware(robot)
     finally:
         disconnect_nero(robot)

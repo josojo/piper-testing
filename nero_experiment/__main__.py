@@ -19,10 +19,17 @@ def read_json(path):
     return strict_json(path.read_text())
 
 
-def write_report(path, report):
+def write_report(path, report, encoded_trajectories=None):
     # Never leave a partially overwritten report if execution is interrupted.
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    if encoded_trajectories is None:
+        text = json.dumps(report, indent=2, allow_nan=False)
+    else:
+        # Trajectories are immutable during execution. Re-encoding their large
+        # arrays at every microstep can starve the Python CAN receiver thread.
+        dynamic = {key: value for key, value in report.items() if key != "trajectories"}
+        text = json.dumps(dynamic, allow_nan=False)[:-1] + ', "trajectories": ' + encoded_trajectories + '}'
+    temporary.write_text(text + "\n")
     temporary.replace(path)
 
 
@@ -42,7 +49,7 @@ def main(argv=None):
     run.add_argument("--viewer", action="store_true")
     run.add_argument("--execute", action="store_true", help="Enable supervised physical execution after simulation")
     run.add_argument("--hardware-config", type=Path, help="Reviewed physical setup and flange calibration")
-    run.add_argument("--max-steps", type=int, default=64, help="Maximum outward steps (1-64); at most 3 LLM attempts per step")
+    run.add_argument("--max-steps", type=int, default=3, help="Maximum outward pose requests (1-64); at most 3 LLM attempts per request")
     run.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     report = {"status": "starting", "hardware_executed": False}
@@ -104,6 +111,7 @@ def main(argv=None):
             if args.viewer:
                 preview(planner, plan)
             if args.execute:
+                encoded_trajectories = json.dumps(report["trajectories"], allow_nan=False)
                 # Persist state before any hardware command; progress is saved
                 # after each settled step and on all handled failures.
                 report["status"] = "awaiting_hardware_execution"
@@ -113,11 +121,11 @@ def main(argv=None):
                 def hardware_progress(message):
                     progress(message)
                     report["status"] = "hardware_execution_in_progress"
-                    write_report(args.output, report)
+                    write_report(args.output, report, encoded_trajectories)
 
                 def record(event):
                     report["hardware_events"].append(event)
-                    write_report(args.output, report)
+                    write_report(args.output, report, encoded_trajectories)
 
                 final = execute(planner, plan, hardware, config,
                                 lambda prompt: input(prompt).strip() == "EXECUTE", hardware_progress, record)

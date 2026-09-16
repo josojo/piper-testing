@@ -147,8 +147,14 @@ class Planner:
 
     def _joints(self, q):
         q = vector(q, 7, "joint configuration")
-        if np.any(q < self.scene.ranges[:, 0]) or np.any(q > self.scene.ranges[:, 1]):
-            raise PlanningError("Joint-position limit exceeded")
+        outside = np.flatnonzero((q < self.scene.ranges[:, 0]) | (q > self.scene.ranges[:, 1]))
+        if len(outside):
+            details = "; ".join(
+                f"{JOINT_NAMES[index]}={q[index]:.6f} rad outside "
+                f"[{self.scene.ranges[index, 0]:.6f}, {self.scene.ranges[index, 1]:.6f}] rad"
+                for index in outside
+            )
+            raise PlanningError("Joint-position limits exceeded: " + details)
         return q
 
     def current_pose(self):

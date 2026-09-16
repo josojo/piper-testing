@@ -123,7 +123,8 @@ def build(model_path: Path, output_path: Path) -> None:
     ET.SubElement(worldbody, "geom", {
         "name": "table",
         "type": "box",
-        "pos": "0 0 -0.06",
+        # The tabletop surface is 5 cm below the robot base reference plane.
+        "pos": "0 0 -0.11",
         "size": "0.60 0.60 0.05",
         "rgba": "0.35 0.22 0.12 1",
         "contype": "1",
@@ -132,13 +133,14 @@ def build(model_path: Path, output_path: Path) -> None:
     ET.SubElement(worldbody, "geom", {
         "name": "table_top",
         "type": "box",
-        "pos": "0 0 -0.005",
+        "pos": "0 0 -0.055",
         "size": "0.58 0.58 0.005",
         "rgba": "0.55 0.35 0.18 1",
     })
     apple = ET.SubElement(worldbody, "body", {
         "name": "apple",
-        "pos": "0.30 0.00 0.04",
+        # Keep the example apple resting on the lowered tabletop.
+        "pos": "0.30 0.00 -0.01",
     })
     ET.SubElement(apple, "geom", {
         "name": "apple_fruit",

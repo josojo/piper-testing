@@ -468,7 +468,7 @@ The joint path uses `s(u) = 10u³ - 15u⁴ + 6u⁵`, with duration chosen from t
 
 ### Collision geometry and explicit exclusions
 
-Every imported robot mesh is enclosed by an oriented box padded by 3 mm on each side. A box also encloses the fixed apple and stem with 3 mm padding. The table top remains at `z=0`. The viewer executor hides proxy group 3 by default; enable that group in the viewer to inspect the boxes. Tests verify that the boxes contain every mesh vertex at multiple arm poses.
+Every imported robot mesh is enclosed by an oriented box padded by 3 mm on each side. A box also encloses the fixed apple and stem with 3 mm padding. The example table top is at `z=-0.05 m`, 5 cm below the robot base reference plane. The viewer executor hides proxy group 3 by default; enable that group in the viewer to inspect the boxes. Tests verify that the boxes contain every mesh vertex at multiple arm poses.
 
 Validation queries MuJoCo forward kinematics and evaluates all forbidden box pairs, including separated pairs without contacts. It uses the 15 separating axes for oriented boxes to obtain a conservative distance lower bound. This avoids the documented positive-distance limitations of some colliders in older MuJoCo releases ([MuJoCo 3.2 API reference](https://mujoco.readthedocs.io/en/3.2.5/APIreference/APIfunctions.html#mj-geomdistance)). The reported clearance is a certified lower bound, not an exact closest-point distance.
 
@@ -498,8 +498,8 @@ Remaining milestones are physical validation of the experimental adapter, hardwa
 `nero_experiment` implements this sequence:
 
 ```text
-Capture all seven measured joint angles, motor/status and gripper feedback
-→ Generate small, reachable Cartesian pose options toward an upright reference
+Capture all seven measured joint angles, motor and arm-status feedback
+→ Generate bounded, reachable Cartesian waypoint options toward an upright reference
 → Gemini selects the next pose using the task, initial observation and simulated state
 → Validate the selected pose and its complete joint path, then simulate it
 → Repeat until upright; validate and simulate the exact reverse joint path
@@ -510,13 +510,13 @@ Capture all seven measured joint angles, motor/status and gripper feedback
 → Verify return to the original measured joint configuration
 ```
 
-**“Upright” means straightening the arm to a reviewed joint reference, not lifting the gripper along a vertical Cartesian line.** The simulation default is all seven joints at zero. Verify that reference on your NERO before physical use. If already at that reference, the experiment reports success without issuing motion or calling the LLM.
+**“Upright” means straightening the arm to a reviewed joint reference.** The simulation default is all seven joints at zero. Verify that reference on your NERO before physical use. If already at that reference, the experiment reports success without issuing motion or calling the LLM.
 
 The LLM is a pose selector. Local forward kinematics and path validation generate reachable choices; Gemini returns a candidate ID, its Cartesian coordinates, quaternion and a reason. Unknown candidates, changed coordinates, malformed JSON, refusals and exhausted retry budgets fail closed. This avoids depending on an LLM to invent geometrically reachable coordinates or solve redundant-arm IK. `Planner.plan_joint_goal` preserves the exact selected joint posture, including for the return leg.
 
 All LLM calls and round-trip simulation happen **before any physical motion**. The prompt explicitly distinguishes the initial measured observation from subsequent predicted simulation states. No claim is made that the arm was re-observed after each LLM call. The hardware must still match its captured starting state after planning, preview and confirmation. The return path is deterministic; faults stop execution instead of attempting an automatic return through an uncertain state.
 
-The default model is **`google/gemini-3.8-flash`**, verified against the [OpenRouter model catalog](https://openrouter.ai/api/v1/models). Requests use [strict structured outputs](https://openrouter.ai/docs/guides/features/structured-outputs), followed by independent local validation. `--model` overrides the ID; unsupported IDs or schema support are errors, with no model substitution. `OPENROUTER_API_KEY` is read from the process environment, never a committed file. Task text, arm state, candidate poses and validation metrics are sent to OpenRouter. No camera images are sent. The default outward budget is 64 steps with at most three LLM attempts per step; HTTP failures abort immediately. Each request has a 45-second timeout and a 4,096-token output cap. API usage is billable.
+The default model is **`gpt-5.6-luna`**. Verify this identifier against the [OpenRouter model catalog](https://openrouter.ai/api/v1/models) before use; unsupported IDs or schema support are errors, with no model substitution. Requests use [strict structured outputs](https://openrouter.ai/docs/guides/features/structured-outputs), followed by independent local validation. `--model` overrides the ID. `OPENROUTER_API_KEY` is loaded from the project-root `.env` or the process environment, with the process environment taking precedence. Task text, arm state, candidate poses and validation metrics are sent to OpenRouter. No camera images are sent. The default outward budget is three pose requests, with at most three LLM attempts per request; `--max-steps` can raise the limit up to 64. HTTP failures abort immediately. Each request has a 60-second timeout and a 4,096-token output cap; timeout/failure details are printed in the rejected report. API usage is billable.
 
 ### Setup on the Ubuntu machine connected to the arm
 
@@ -532,7 +532,7 @@ python -m unittest discover -s tests -v
 mkdir -p reports
 ```
 
-The hardware dependency pins `pyAgxArm==1.0.0`. Its aggregate joint getter can contain partially stale data; this adapter deliberately inspects all four constituent joint packets. Changing the SDK version requires reviewing that integration. The existing `nero_safety_common.py` selects NERO firmware `V121`; the actual controller firmware must match the reviewed setup.
+The hardware requirements install AgileX's `pyAgxArm` directly from its [official GitHub repository](https://github.com/agilexrobotics/pyAgxArm), because it is not available from the Python package index. Git must be installed for this step. The adapter requires SDK version `1.0.0`, checked when connecting; its aggregate joint getter can contain partially stale data, so this adapter deliberately inspects all four constituent joint packets. If the upstream Git repository changes to another version, review that integration before using it. The existing `nero_safety_common.py` selects NERO firmware `V121`; the actual controller firmware must match the reviewed setup.
 
 Configure the existing SocketCAN adapter as appropriate for your server. For the default `can0` at 1 Mbit/s:
 
@@ -542,7 +542,7 @@ export NERO_CAN_INTERFACE=socketcan
 export NERO_CAN_CHANNEL=can0
 ```
 
-Ensure `OPENROUTER_API_KEY` is exported in the shell that runs the experiment. Simulation alone needs only `requirements-mujoco.txt`. Use the offline smoke test first; it neither connects to CAN nor calls OpenRouter:
+Put `OPENROUTER_API_KEY=...` in a project-root `.env` file, or export it in the shell. The experiment loads `.env` automatically; an already-exported shell value takes precedence. `.env` is git-ignored. Simulation alone needs only `requirements-mujoco.txt`. Use the offline smoke test first; it neither connects to CAN nor calls OpenRouter:
 
 ```bash
 python -m nero_experiment run --offline-demo --output reports/offline.json
@@ -552,7 +552,7 @@ This uses a slightly bent simulated arm, four outward steps and four return step
 
 ### Capture state and test Gemini without movement
 
-The modeled AGX gripper must be installed, empty and fully open. The current adapter requires width-mode feedback at **0.100 m ± 0.001 m**. Missing/closed gripper feedback is rejected; it does not open the gripper for you. A different tool requires updating the model and adapter.
+This experiment reads and moves the NERO arm only. It neither initializes nor commands an effector, and it does not require gripper feedback. The MuJoCo scene still contains the AGX gripper as passive collision geometry and uses its modeled grasp-center frame for Cartesian candidate generation; review that geometry against the actual tool setup before physical use.
 
 Capture a stationary state without enabling, resetting, disabling or moving the arm:
 
@@ -593,7 +593,7 @@ Complete its fields after checking the actual installation:
 - `scene_fingerprint`: copy from the dry run **after** reviewing the scene against the real table, robot mount, tool, payload and obstacles. The default scene includes an example table/apple; it does not observe your surroundings. Rebuild and review when geometry changes.
 - `upright_joints_rad`: a verified upright posture in SDK joint order/radians. Check joint signs, zero offsets and the model against measurements at multiple configurations; all-zero is an initial model convention.
 - `flange_position_in_link7_m` and `flange_orientation_in_link7_xyzw`: the calibrated transform from the model's `link7` frame to the SDK-reported flange frame. The example identity transform is a placeholder, not a calibration. The adapter compares model and measured flange poses before movement and after every settled microstep, rejecting differences above 5 mm or 3 degrees. Agreement at one pose is not sufficient calibration.
-- The six verification booleans must reflect completed checks: firmware, joint conventions, upright reference, tool/scene, tested physical emergency stop and empty gripper. Strings such as `"true"` are rejected. Review the documented structural collision exclusions; they still apply.
+- The five verification booleans must reflect completed checks: firmware, joint conventions, upright reference, tool/scene, and tested physical emergency stop. Strings such as `"true"` are rejected. Review the documented structural collision exclusions; they still apply.
 
 Keep the workspace clear, supervise the first experiment and have the physical emergency stop accessible. Manually enable the supported arm through your established procedure. This program preserves motor enable state on normal exit and sends an electronic emergency stop on an execution fault; it does not reset faults or automatically disable motors, which could release the arm.
 
@@ -622,23 +622,30 @@ The operator must type `EXECUTE` after successful simulation and preflight. Any 
 
 | Check | Initial experiment setting |
 | --- | --- |
-| LLM-selected joint/Cartesian step | At most 0.08 rad per joint / 0.03 m |
+| LLM pose-request budget | At most 3 outward requests by default (`--max-steps` can override) |
+| Validated waypoint size | At most 1.0 rad per joint / 0.5 m |
 | Simulated velocity / acceleration | 0.08 rad/s / 0.15 rad/s² |
+| Maximum simulated segment duration | 30 s |
 | Maximum start-to-upright joint excursion | 3 rad per joint |
-| Controller speed setting | 3% |
-| Nominal hardware microstep | At most 0.005 rad per joint |
+| Controller speed setting | 1% |
+| Controller joint acceleration cap | 0.15 rad/s², or the lower simulated/existing joint limit; verified before motion |
+| Nominal hardware microstep | At most 0.002 rad per joint; each waypoint is split into these slow commands |
 | Hardware start mismatch | At most 0.001 rad |
 | Position tolerance for settling | 0.0005 rad for at least 0.3 s |
 | Certified tracking envelope | Endpoint joint bounds expanded by 0.002 rad |
-| Required collision clearance | 0.03 m throughout each checked envelope |
+| Required collision clearance | 0.005 m throughout each checked envelope |
 | Joint packet age / inter-packet skew | At most 50 ms / 20 ms |
 | Other feedback packet age / overall skew | At most 250 ms / 150 ms |
 | Motor velocity trip threshold | 0.10 rad/s; joint finite-difference cross-check at 0.11 rad/s |
 | Polling period | 20 ms, subject to OS and SDK scheduling |
 | Per-microstep / whole execution timeout | At least 5 s per step / 1,200 s overall |
 
-`move_j` performs controller-side interpolation, not the exact quintic timing seen in simulation. Therefore the adapter certifies a whole joint-angle box for each microstep, including a tracking margin: every combination of joint positions within that box has the required modeled clearance. This accounts for differing joint timing. Conservative geometry-motion bounds can reject a move even when a line-path simulation passes; do not bypass that rejection by reducing clearances without reviewing the model.
+The three-request default reduces LLM cost by choosing larger prevalidated waypoints. It does not raise the simulated speed or acceleration limits: those remain 0.08 rad/s and 0.15 rad/s². `move_j` performs controller-side interpolation, not the exact quintic timing seen in simulation. The adapter splits each waypoint into at most 0.002 rad joint microsteps, uses a 1% controller speed setting, and settles each command from measured feedback. It certifies a whole joint-angle box for each microstep, including a tracking margin: every combination of joint positions within that box has the required modeled clearance. This accounts for differing joint timing. The upright experiment uses a 5 mm minimum clearance so closer modeled link pairs can pass; this is a small model-based margin and can still be less than the collision-proxy model error. Review the geometry against the real setup before any physical execution. Conservative geometry-motion bounds can still reject a move even when a line-path simulation passes. A run may reject the three-waypoint plan if any large segment cannot be certified within the configured joint, translation, clearance or duration limits.
 
-The monitor checks fresh joint, motor, driver, gripper and arm-status feedback; bounds joint position and measured speed; and waits for measured arrival, not just an idle flag. A fault, timeout, stale packet, tracking deviation or Ctrl-C during execution triggers a best-effort electronic stop and cancels the remaining outward/return commands. Reports record the measured state and goal before each command and the achieved state after settling; an aborted report explicitly indicates that physical motion may have occurred.
+The monitor checks fresh joint, motor, driver and arm-status feedback; bounds joint position and measured speed; and waits for measured arrival, not just an idle flag. Before a command, joint age/skew failures reset the settling dwell and are resampled within the existing 5-second stationary timeout. Every accepted joint snapshot must still meet the 50 ms age / 20 ms skew limits. During an active move, timing failures still abort immediately. Timing errors include individual packet ages and skew; controller/driver faults are not retried by the stationary check. Execution report updates reuse serialized trajectories to reduce interference with the SDK receiver thread. A fault, timeout, stale packet, tracking deviation or Ctrl-C during execution triggers a best-effort electronic stop and cancels the remaining outward/return commands. Reports record the measured state and goal before each command and the achieved state after settling; an aborted report explicitly indicates that physical motion may have occurred. A motor or finite-difference velocity trip also records a `velocity_limit_exceeded` event with the source, joint, threshold, goal, elapsed command time, and up to 26 recent feedback snapshots (roughly 0.5 seconds at nominal polling, including the offending sample). Snapshots contain joint positions, motor velocities and packet timestamps. The buffer stays in memory during motion; serialization and report writing happen only after the electronic stop has been attempted, including when stop delivery fails. Diagnostic report failures do not replace the original motion/stop error.
 
-This Python process is not a real-time safety controller. Polling can miss between-sample deviations, CAN/software stops can fail, and process termination or power loss can prevent cleanup. The simulator does not validate real acceleration, stopping distance, payload dynamics or controller tracking. Full extension can be singular; a controller singularity status aborts the experiment rather than forcing the last move. Physical validation, refined collision exclusions and an independent stop remain necessary. The adapter has been tested with fake feedback offline, not on a physical NERO.
+This Python process is not a real-time safety controller. Polling can miss between-sample deviations, CAN/software stops can fail, and process termination or power loss can prevent cleanup. The simulator does not validate real acceleration, stopping distance, payload dynamics or controller tracking. Full extension can be singular; a controller singularity status aborts the experiment rather than forcing the last move. Physical validation, refined collision exclusions and an independent stop remain necessary. Automated motion tests use fake feedback. The corrected acceleration setup has also been checked on a physical NERO 1.21 without sending motion commands; all seven joints read back 0.15 rad/s² (see `reports/acceleration-setup-verified-20260916.json`). This does not validate trajectory tracking during physical execution.
+
+The 0.002 rad microsteps may reduce transient motion peaks but do not enforce acceleration or guarantee compliance with the velocity trip threshold. They increase the command count and execution time; the 2,000-command and 1,200-second limits remain in force. The SDK accepts integer speed percentages, so a fractional ramp between 0% and 1% is unavailable. After EXECUTE confirmation, the experiment lowers controller joint acceleration limits to at most 0.15 rad/s² (or the lower simulated limit), preserves existing stricter limits, and requires fresh readback for all seven joints before any movement. Missing, stale, mismatched or invalid readback aborts execution. The reduced limits remain configured after success or failure; the experiment never automatically restores higher acceleration. This supplies a controller acceleration cap, not a continuous trajectory or a jerk limit. The velocity trip thresholds remain unchanged.
+
+The project-local `nero_experiment/sdk_compat.py` repairs the acceleration write path for NERO firmware 1.21 and the pyAgxArm revision pinned in `requirements-hardware.txt`. NERO 1.21 uses different write and feedback units: 0.01 rad/s² for CAN 0x475 writes and 0.001 rad/s² for 0x47C feedback. The upstream setter incorrectly scales writes by 10,000 instead of 100; the compatibility path encodes 0.15 rad/s² as raw 15 and waits up to one second for matching fresh readback. Configuration can take effect after the first query. A missing response can consume the one-second query timeout. Zero-calibration and fault-clearing fields stay disabled. This avoids modifying installed site-packages; calls to the upstream setter outside this adapter are not patched. Other SDK revisions or firmware versions require review. Execution reports retain the original, requested and verified limits, including completed changes if a later joint fails.
