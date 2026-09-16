@@ -1,0 +1,11 @@
+{
+  "mode": "hardware",
+  "reviewed_hardware": false,
+  "namespace": "/nero",
+  "named_poses": {
+    "inspection": {"delta_from_start_rad": [0.02, 0, 0, 0, 0, 0, 0]}
+  },
+  "collision_boxes": [
+    {"id": "table", "size_m": [2, 2, 0.04], "center_m": [0, 0, -0.03]}
+  ]
+}

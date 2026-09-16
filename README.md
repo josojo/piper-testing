@@ -4,7 +4,72 @@ This project aims to let an AgileX NERO arm carry out natural-language instructi
 
 **Project direction:** use Python for the LLM application and tool validation, ROS 2 + MoveIt 2 for planning and execution, and MuJoCo as an optional physics testing environment.
 
-**Implementation status:** this architecture is the migration target, not an implemented ROS 2 integration. The repository currently contains a custom MuJoCo planner, an OpenRouter upright-and-return experiment, and direct Python/CAN hardware utilities. Their existing commands are retained below as experimental reference. This README change does not install ROS 2 or alter hardware execution.
+**Implementation status:** `nero_agent` implements the first named-pose action loop, a ROS 2 Humble / MoveIt 2 backend, and a NERO streaming bridge. It includes the attached standard AgileX gripper model and reads its opening; this first test does not command the gripper. The offline checks pass, but the Docker/ROS integration and physical tracking still require validation. Perception and grasping are future work.
+
+## Try the new experiment
+
+First, test the application loop with ordinary Python, without ROS, hardware, or an API key:
+
+```bash
+python3 -m nero_agent run --offline-demo --output reports/agent-offline.json
+```
+
+This uses a test double: it checks action/result plumbing, not collisions or robot motion.
+
+For the real MoveIt planner and ROS controller using mock hardware, build the Humble container and run the deterministic round trip:
+
+```bash
+sudo ./scripts/nero_ros2.sh build
+sudo ./scripts/nero_ros2.sh demo --scripted --output reports/agent-moveit.json
+```
+
+Omit `sudo` if your account already has Docker access. The mock demo runs in a private container network without access to the host CAN interface. It plans a 0.02 rad change in joint 1, executes through the mock ROS controller, verifies feedback, and returns to the captured start. It includes the gripper and an example table in the collision scene. Logs are in `reports/ros2-mock-*.log`; the JSON report records decisions, plans, and results.
+
+To let the LLM choose the actions, set `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` in the repository `.env`, then run:
+
+```bash
+sudo ./scripts/nero_ros2.sh demo \
+  --instruction "Move to inspection, then return to start." \
+  --output reports/agent-llm.json
+```
+
+The LLM may choose only configured named poses, observe state, stop, or finish. It receives feedback after each completed action. `--scripted` replaces only the LLM; MoveIt and the ROS controller still run. Omitting it makes real OpenRouter requests. The Docker build context contains only `ros2/`, so the API key is not copied into the image.
+
+The container image has built successfully on the host. The first ROS demo exposed an executor-context startup bug, which has been corrected; a complete ROS round trip and physical execution still require verification. The offline test is not evidence that ROS or hardware execution passed. Docker access from the coding session still requires administrator credentials.
+
+### Hardware capture, planning, and supervised execution
+
+```bash
+cp examples/nero-agent.hardware.example.json nero-agent.local.json
+sudo ./scripts/nero_ros2.sh capture nero-agent.local.json --output reports/agent-start.json
+sudo ./scripts/nero_ros2.sh hardware nero-agent.local.json --scripted \
+  --output reports/agent-plan.json
+```
+
+Capture reads the arm and attached gripper. The second command plans only the first motion, without opening the execution gate. Both commands start and clean up their own ROS stack. The bridge never automatically enables, resets, or homes the arm. Use the existing isolated hardware setup procedure first; do not run another controller or direct-motion script concurrently.
+
+Before physical execution, review `nero-agent.local.json`: the example table is a placeholder in `base_link` coordinates, `inspection` is a small relative joint target, and the model assumes the standard AgileX gripper. Verify mounting, actual tool geometry, obstacles, joint conventions, and the vendor SRDF collision exclusions. Set `reviewed_hardware` to `true` once that review is complete. Then:
+
+```bash
+sudo ./scripts/nero_ros2.sh hardware nero-agent.local.json --scripted --execute \
+  --output reports/agent-execution.json
+```
+
+Each physical motion requires typing `EXECUTE`. Start with the deterministic test before using LLM choices. A failure ends the sequence without an automatic return or retry. Initial hardware testing must establish tracking and stop behavior; this bridge has not yet been physically validated.
+
+Plans use 0.08 rad/s velocity and 0.15 rad/s² acceleration caps, with a 0.15 rad maximum excursion from the captured start. The controller streams timed positions using SDK `move_js`; it does not split the path into separately planned `move_j` moves. The bridge retains the 0.10 rad/s measured-velocity guard, fresh-feedback checks, tracking bounds, and a command/heartbeat watchdog. It reuses the pinned SDK and firmware-specific acceleration encoding/readback correction. These checks can reject a trajectory; they do not establish physical tracking performance in advance.
+
+For an already running stack, `python3 -m nero_agent stop --config nero-agent.local.json` requests an electronic stop and cancels the active action from the same sourced ROS environment and domain (default `ROS_DOMAIN_ID=73`). Stop delivery is reported separately from measured standstill. Keep the physical emergency stop available during initial trials.
+
+For a native Humble environment with the dependencies and pinned vendor packages from [ros2/Dockerfile](ros2/Dockerfile) installed and sourced:
+
+```bash
+export ROS_DOMAIN_ID=73 ROS_LOCALHOST_ONLY=1
+python3 -m nero_agent doctor
+python3 -m nero_agent.bringup --config examples/nero-agent.mock.json --scripted --execute
+```
+
+The hardware ROS plugin is `topic_based_ros2_control/TopicBasedSystem`, connected to actual SDK feedback. `mock_components/GenericSystem` is used only for the mock test. The project bridge owns hardware commands; the vendor direct driver is not launched alongside it. MuJoCo is installed in the container because the reused hardware reader imports the old experiment package, but it does not plan or gate these motions.
 
 ## Target architecture
 
@@ -32,7 +97,7 @@ The control loop is: observe the current state, select one action, validate and 
 | Perception and transforms, added later | Locate objects, maintain scene geometry, and transform measured poses into known robot frames. |
 | MuJoCo, optional | Test physics, contact, grasping, and repeatable simulated scenarios when those capabilities are needed. |
 
-Python remains the application language. MoveIt provides a [Python planning API (`moveit_py`)](https://moveit.picknik.ai/main/doc/examples/motion_planning_python_api/motion_planning_python_api_tutorial.html). AgileX provides a [NERO-compatible ROS 2 and MoveIt integration](https://github.com/agilexrobotics/agx_arm_ros/blob/ros2/src/agx_arm_moveit/README_EN.md), including a `FollowJointTrajectory` interface through `ros2_control`. These are the starting points for the migration; their behavior on this arm must be verified before adding LLM control.
+Python remains the application language. MoveIt provides a [Python planning API (`moveit_py`)](https://moveit.picknik.ai/main/doc/examples/motion_planning_python_api/motion_planning_python_api_tutorial.html). AgileX provides a [NERO-compatible ROS 2 and MoveIt integration](https://github.com/agilexrobotics/agx_arm_ros/blob/ros2/src/agx_arm_moveit/README_EN.md), including a `FollowJointTrajectory` interface through `ros2_control`. The new backend uses MoveIt ROS services/actions from Python and the vendor robot description, with a project hardware bridge. Their physical behavior on this arm remains to be verified.
 
 Only the selected execution backend should command the physical arm. The LLM and application tools must not bypass it through direct CAN or SDK calls. Existing direct-control scripts must not run alongside the ROS 2 motion controller.
 
@@ -40,18 +105,19 @@ Only the selected execution backend should command the physical arm. The LLM and
 
 Start with a small set of tools backed by deterministic implementations:
 
-| Proposed tool | Purpose |
+| Tool | Purpose |
 | --- | --- |
 | `get_state()` | Return fresh measured joint state, robot status, and whether an action is active. |
 | `move_to_named_pose(name)` | Plan and execute a motion to a reviewed pose, starting from the measured state. |
 | `stop()` | Request cancellation/stop through the execution layer and report the observed outcome. |
 
-These are proposed interfaces, not commands currently implemented in this repository. A request could look like:
+The implemented action contract also includes `finish`. A request looks like:
 
 ```json
 {
   "action": "move_to_named_pose",
-  "arguments": {"name": "inspection"}
+  "pose": "inspection",
+  "reason": "Inspect the reviewed pose"
 }
 ```
 
@@ -107,13 +173,13 @@ Use MuJoCo for contact-rich tasks, grasp experiments, synthetic observations, an
 
 The original idea of testing motion in simulation remains useful. A simulation pass alone does not establish how the physical arm will move: model geometry, calibration, payload, controller behavior, and feedback timing all matter.
 
-The current experimental executor validates a timed MuJoCo trajectory but executes separate controller-interpolated `move_j` microsteps. That does not preserve the simulated timing. The new architecture should validate the complete path from a MoveIt plan through controller execution to measured motion.
+The current experimental executor validates a timed MuJoCo trajectory but executes separate controller-interpolated `move_j` microsteps. That does not preserve the simulated timing. The new architecture is designed to validate the complete path from a MoveIt plan through controller execution to measured motion.
 
 MoveIt can provide [trajectory timing and optional jerk-limited smoothing](https://moveit.picknik.ai/main/doc/examples/time_parameterization/time_parameterization_tutorial.html), but the configured driver must faithfully execute the result. A preview in RViz is not a physics simulation or a physical tracking test. MuJoCo adds physics testing where needed; it is no longer the required planner or hardware execution gate.
 
 Retain physical emergency stop, bounded motion, fresh-state checks, fault monitoring, and supervised initial execution. Planned limits and software monitoring do not replace physical safeguards. A stop must not automatically disable motors or reset the controller, since either can change how the arm is supported.
 
-The vendor ROS integration uses pyAgxArm, so changing frameworks does not automatically resolve SDK/firmware issues. Existing findings about feedback freshness and acceleration command units must be checked in the ROS driver path. The project-local acceleration compatibility fix currently applies only to the experimental Python adapter; it is not automatically installed into the vendor ROS stack.
+The vendor ROS integration uses pyAgxArm, so changing frameworks does not automatically resolve SDK/firmware issues. Existing findings about feedback freshness and acceleration command units must be checked in the ROS driver path. The project ROS bridge reuses the experimental adapter’s pinned-SDK checks and acceleration compatibility fix before opening its command gate; it does not rely on the vendor driver to install that correction.
 
 ## Current implementation and reuse
 
@@ -126,11 +192,11 @@ The vendor ROS integration uses pyAgxArm, so changing frameworks does not automa
 | `nero_experiment/sdk_compat.py` | Project-local acceleration encoding/readback correction for the reviewed SDK and NERO firmware. Preserve the tests and hardware findings during driver integration. |
 | `tests/` and execution reports | Existing offline checks and diagnostic evidence. Extend with ROS integration and measured execution checks during migration. |
 
-The ROS 2 backend, proposed Python tools, feedback-driven LLM loop, and camera-based object skills are not implemented yet. The immediate next milestone is **one verified NERO motion through the vendor ROS 2/MoveIt integration, callable from Python**.
+The ROS backend and named-pose LLM loop now live in `nero_agent/`, with bringup in `ros2/`. The milestones above describe acceptance criteria, not completed hardware validation. The next validation step is the containerized MoveIt mock round trip, followed by **one supervised, measured NERO motion**. Camera-based object skills remain unimplemented.
 
 ## Existing experimental workflows
 
-The sections below document the current implementation for reproducibility and diagnostics. They are not setup instructions for the target ROS 2 architecture. Their `--execute` commands still use direct SDK/CAN control, not MoveIt. No ROS launch files or migration commands have been added to this project yet.
+The sections below document the current implementation for reproducibility and diagnostics. They are not setup instructions for the target ROS 2 architecture. Their `--execute` commands still use direct SDK/CAN control, not MoveIt. Use the new commands above for the ROS 2 path.
 
 ## Preparing the MuJoCo environment
 
