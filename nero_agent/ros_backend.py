@@ -181,19 +181,29 @@ class RosBackend:
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def plan(self, goal):
+        before = self.state()
+        goal = vector(goal)
+        trajectory, digest, summary = self._plan_from_state(goal, before)
+        token = uuid.uuid4().hex
+        self.plans[token] = (trajectory, before, goal, digest)
+        return {'token': token, 'backend': 'moveit2', 'collision_checked': True,
+                'start': before['joints_rad'], 'goal': list(goal), **summary}
+
+    def _plan_from_state(self, goal, before):
+        """Plan from an explicitly supplied fresh measured state."""
         from moveit_msgs.srv import GetMotionPlan
         from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
         from rcl_interfaces.srv import GetParameters
         from .trajectory import validate_model_bounds
-        before = self.state()
         goal = vector(goal)
+        before_joints = vector(before['joints_rad'])
         # Read the model actually loaded by MoveIt, not a second local copy.
         client = self.node.create_client(GetParameters, self.settings.namespace + '/move_group/get_parameters')
         try:
             response = self._call(client, GetParameters.Request(names=['robot_description']))
             if len(response.values) != 1 or not response.values[0].string_value:
                 raise AgentError('MoveIt robot_description is unavailable for joint-limit validation')
-            validate_model_bounds(response.values[0].string_value, before['joints_rad'], goal)
+            validate_model_bounds(response.values[0].string_value, before_joints, goal)
         finally:
             self.node.destroy_client(client)
         if distance(goal, self.initial) > self.settings.max_excursion:
@@ -212,7 +222,7 @@ class RosBackend:
         motion.max_acceleration_scaling_factor = min(1.0, self.settings.max_acceleration / .15)
         motion.start_state.is_diff = True
         motion.start_state.joint_state.name = list(JOINTS) + ['gripper']
-        motion.start_state.joint_state.position = list(before['joints_rad']) + [before['gripper_width_m']]
+        motion.start_state.joint_state.position = list(before_joints) + [before['gripper_width_m']]
         constraints = Constraints()
         constraints.joint_constraints = [JointConstraint(joint_name=n, position=q,
             tolerance_above=0.0005, tolerance_below=0.0005, weight=1.0) for n, q in zip(JOINTS, goal)]
@@ -222,12 +232,9 @@ class RosBackend:
             raise AgentError('MoveIt planning failed: error %d' % response.error_code.val)
         trajectory = response.trajectory
         from .trajectory import validate_trajectory
-        summary = validate_trajectory(trajectory.joint_trajectory, before['joints_rad'], goal,
+        summary = validate_trajectory(trajectory.joint_trajectory, before_joints, goal,
                                       self.initial, self.settings)
-        token = uuid.uuid4().hex
-        self.plans[token] = (trajectory, before, goal, digest)
-        return {'token': token, 'backend': 'moveit2', 'collision_checked': True,
-                'start': before['joints_rad'], 'goal': list(goal), **summary}
+        return trajectory, digest, summary
 
     def execute(self, plan):
         if self.hardware:
@@ -262,7 +269,14 @@ class RosBackend:
                 if (distance(current['joints_rad'], before['joints_rad']) > 0.005
                         or abs(current['gripper_width_m'] - before['gripper_width_m']) > 0.001):
                     raise AgentError('Arm or gripper changed during hardware setup; re-plan')
-                self._sync_trajectory_start(trajectory, current, goal)
+                # Driver setup and the final feedback read can happen after
+                # the original plan was timed. If the measured state moved,
+                # replan from that exact state so MoveIt's first-point
+                # velocity/acceleration and controller spline timing match
+                # the state that will move.
+                if (distance(current['joints_rad'], before['joints_rad']) > 1e-6
+                        or abs(current['gripper_width_m'] - before['gripper_width_m']) > 1e-6):
+                    trajectory, digest, _ = self._plan_from_state(goal, current)
             request = ExecuteTrajectory.Goal(trajectory=trajectory)
             self.pending_goal = self.executor.send_goal_async(request)
             self.goal_handle = self._wait(self.pending_goal, monitor=True)

@@ -30,7 +30,7 @@ def main():
     from std_msgs.msg import Empty, String
     from std_srvs.srv import SetBool, Trigger
     from action_msgs.srv import CancelGoal
-    from nero_experiment.hardware import connect
+    from nero_experiment.hardware import MAX_JOINT_SNAPSHOT_AGE_S, connect
 
     class Driver(Node):
         def __init__(self, hardware):
@@ -300,7 +300,8 @@ def main():
             if args.diagnose_feedback or not self.guard or self.abort.phase != 'idle':
                 return
             try:
-                if self.last_state is None or time.monotonic() - self.received > 0.05:
+                if (self.last_state is None
+                        or time.monotonic() - self.received > MAX_JOINT_SNAPSHOT_AGE_S):
                     raise AgentError('No fresh measured state for command')
                 if len(msg.name) != len(msg.position) or len(set(msg.name)) != len(msg.name):
                     raise AgentError('Malformed controller joint command: %d names, %d positions' %

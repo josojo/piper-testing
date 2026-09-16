@@ -445,6 +445,26 @@ class RosExecutionTests(unittest.TestCase):
             b.execute({'token': 'test'})
         self.assertEqual(events, ['setup', 'fresh feedback', 'send'])
 
+    @patch('nero_agent.abort_policy.require_verified_controlled_abort')
+    def test_hardware_execution_replans_from_final_measured_state(self, capability):
+        b = self.backend()
+        b.hardware, b.gate = True, object()
+        initial = b.state()
+        refreshed = deepcopy(initial)
+        refreshed['joints_rad'][0] += .001
+        states = [initial, refreshed]
+        b.state = lambda: states.pop(0)
+        b.sample = 'old sample'
+        b._call = lambda *a, **k: NS(success=True)
+        replanned = MagicMock(return_value=(object(), 'unchanged', {}))
+        b._plan_from_state = replanned
+        b.executor.send_goal_async = MagicMock()
+        b._wait = lambda *a, **k: NS(accepted=False)
+        with self.imports(), self.assertRaisesRegex(AgentError, 'rejected'):
+            b.execute({'token': 'test'})
+        replanned.assert_called_once_with([.02] + [0.] * 6, refreshed)
+        b.executor.send_goal_async.assert_called_once()
+
     def test_action_success_without_measured_arrival_is_rejected(self):
         b = self.backend()
         b._wait = lambda future, *a, **k: (

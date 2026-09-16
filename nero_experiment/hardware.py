@@ -76,6 +76,10 @@ class ArmState:
 
 MAX_FEEDBACK_AGE_S = 0.25
 MAX_FEEDBACK_SKEW_S = 0.15
+# Joint packets are read sequentially from the SDK. Keep a small allowance for
+# read/ROS scheduling jitter while retaining the tighter packet-skew check.
+MAX_JOINT_SNAPSHOT_AGE_S = 0.055
+MAX_JOINT_SNAPSHOT_SKEW_S = 0.020
 START_MATCH_RAD = 0.001
 SETTLE_TOLERANCE_RAD = 0.0005
 TRACKING_ENVELOPE_RAD = 0.002
@@ -188,12 +192,13 @@ class NeroHardware:
         # spent gathering other feedback counts toward snapshot age.
         ages = [self.wall_clock() - stamp for stamp in joint_timestamps]
         skew = max(joint_timestamps) - min(joint_timestamps)
-        if skew > 0.02 or max(ages) > 0.05:
+        if skew > MAX_JOINT_SNAPSHOT_SKEW_S or max(ages) > MAX_JOINT_SNAPSHOT_AGE_S:
             detail = ", ".join(f"{name}={age * 1000:.1f} ms" for name, age in
                                zip(("joint_12", "joint_34", "joint_56", "joint_7"), ages))
             raise JointFeedbackTimingError(
-                f"Joint feedback timing rejected: skew={skew * 1000:.1f} ms (limit 20 ms); "
-                f"ages [{detail}] (limit 50 ms)")
+                f"Joint feedback timing rejected: skew={skew * 1000:.1f} ms (limit "
+                f"{MAX_JOINT_SNAPSHOT_SKEW_S * 1000:.0f} ms); ages [{detail}] "
+                f"(limit {MAX_JOINT_SNAPSHOT_AGE_S * 1000:.0f} ms)")
         return ArmState(tuple(q), tuple(velocities), tuple(enabled), state_code, int(status.motion_status),
                         tuple(flange), tuple(timestamps), self.wall_clock(),
                         joint_timestamps, tuple(motor_timestamps))
