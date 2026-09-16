@@ -8,6 +8,8 @@ This project aims to let an AgileX NERO arm carry out natural-language instructi
 
 ## Try the new experiment
 
+**Normal hardware trajectory execution remains blocked.** An experimental controlled-abort candidate now follows the vendor's MOVE J holding approach, but it has not been physically qualified. Capture, planning, and mock execution remain available. `reviewed_hardware=true` does not remove the block. Historical hardware `--execute` examples below remain blocked.
+
 First, test the application loop with ordinary Python, without ROS, hardware, or an API key:
 
 ```bash
@@ -37,6 +39,81 @@ The LLM may choose only configured named poses, observe state, stop, or finish. 
 
 The container image has built successfully on the host. The first ROS demo exposed an executor-context startup bug, which has been corrected; a complete ROS round trip and physical execution still require verification. The offline test is not evidence that ROS or hardware execution passed. Docker access from the coding session still requires administrator credentials.
 
+### Mechanically supported hold validation
+
+The controlled-abort path now latches streamed commands off, requests cancellation on the dedicated arm trajectory controller, captures fresh enabled-joint feedback, and sends **one `move_j` target at that measured position**. It never resumes streaming automatically. The driver owns this sequence, so a client error does not prevent its cancellation attempt or hold monitoring.
+
+Cancellation is allowed up to 0.2 seconds; if unavailable, rejected, or timed out, that fact is recorded and the driver still attempts the hold with fresh feedback. Queued controller commands cannot pass the latched gate. Cancellation and physical hold results are separate report fields. The existing velocity guard remains unchanged.
+
+The observer allows up to 5 seconds to settle and requires one continuous second within 0.005 rad of the hold target, below 0.01 rad/s, with fresh enabled feedback. Excursion beyond 0.02 rad, feedback loss, failure to settle, or subsequent loss of holding is reported as a failure. These are observation criteria, not a firmware deceleration guarantee. A failure does **not** automatically invoke damping, disable, reset, or repeatedly chase the moving position. Physical support and operator intervention remain necessary if holding fails.
+
+With the arm mechanically supported against a fall, the workspace clear, and other controllers stopped, the separate validation command is:
+
+```bash
+sudo ./scripts/nero_ros2.sh validate-hold nero-agent.local.json \
+  --output reports/agent-hold.json
+```
+
+This test starts from a stationary pose and prompts for `SUPPORTED HOLD` before sending a position command. It can move the arm during mode entry. It does not enable or reset joints, change gains/speed/acceleration settings, or issue a trajectory. It tests entry into MOVE J holding, **not a JS-to-J transition or an abort during motion**. Passing it does not automatically authorize trajectory execution or mark the controller physically qualified.
+
+During an active stack, `python3 -m nero_agent stop --config nero-agent.local.json` requests the controlled abort. The driver continues observing holding while it remains running. The validation wrapper cleans up its ROS processes after the bounded observation; ongoing monitoring ends then, and the last MOVE J target is left in the controller without disabling/resetting it. This does not establish behavior after communication or power loss.
+
+The old damping stop remains a separate, explicitly invoked ROS service at `/nero/project/emergency_stop` (`std_srvs/srv/Trigger`). It can permit descent and is not an automatic fallback from controlled-abort failure. A kill, lost CAN connection, or power failure cannot be made safe by this Python observer.
+
+### Stationary feedback timing diagnostic
+
+With the arm stationary and supported, and other controllers stopped:
+
+```bash
+sudo ./scripts/nero_ros2.sh diagnose-feedback nero-agent.local.json \
+  --duration 30 --output reports/agent-feedback-diagnostic.json
+```
+
+This standalone ROS timer reads feedback at a requested 100 Hz without starting MoveIt, opening an execution gate, enabling joints, or sending motion/stop commands. Existing feedback freshness limits are unchanged. It records failures as diagnostic data and writes the report after collection, avoiding per-sample log or disk overhead. Duration is bounded to 1–120 seconds. Ctrl-C saves partial samples.
+
+The JSON contains timer intervals, callback and hardware-read durations, joint packet timestamps/ages before and after each read, valid measured states, and read errors. Summary statistics include maxima and 99th percentiles. Long timer intervals with short reads suggest scheduling/executor delays; long reads indicate time spent in the reader, including possible preemption. Old packets even with regular timer callbacks suggest a feedback-delivery problem. These are diagnostic clues, not a definitive root-cause classification.
+
+Timestamp advances are sampled from the SDK cache, not measured directly on the CAN wire; intermediate packets may be missed. This baseline excludes full ROS controller load, and completion means data collection finished—not that feedback or holding passed validation. The diagnostic never takes control of an already moving arm.
+
+For comparison under full idle ROS/MoveIt/controller load, use:
+
+```bash
+sudo ./scripts/nero_ros2.sh diagnose-feedback-stack nero-agent.local.json \
+  --duration 30 --output reports/agent-feedback-stack.json
+```
+
+This starts the normal stack in a dedicated diagnostic mode. Collection starts after readiness, inside the hardware bridge's existing timer and SDK connection. The bridge rejects execution-gate, commissioning, stop, and emergency-stop service requests in this mode, and ignores streamed commands. Keep other controllers stopped and the arm stationary and supported. The test does not enable, disable, reset, or command the arm. It does not actively maintain or verify holding.
+
+Compare `read_errors`, packet ages, `timer_interval_s`, and `read_duration_s` with the standalone report. Full-stack callback duration also includes gripper reads, publication and bridge error logging; `bridge_errors` records failures outside the arm reader as well. During collection this diagnostic also builds a bounded, diagnostic-only trace and polls the actual abort-status service at most 10 times per second. Live replies contain no trace or trace-based calculations. The summary includes request count and maximum response size; `reporting_test.full_trace` contains the report fetched once after collection. This tests the reporting workload without issuing an abort or position command. Full abort reports are unavailable during active observation; normal commissioning also uses compact polling and a final trace fetch. Interrupted full-stack tests record interruption without exporting partial samples. Completion means collection finished, not a safety qualification. No Docker rebuild is needed.
+
+### Supported abort test during motion
+
+Analyze an existing report without ROS or hardware access:
+
+```bash
+python -m nero_agent.analyze_abort reports/agent-moving-abort-compact-status.json \
+  --output reports/agent-moving-abort-analysis.json
+```
+
+The analysis lists each joint's reported peak velocity, nearby positions, and displacement from the holding target. New commissioning traces also retain separate position-packet and motor-velocity timestamps from the checked SDK snapshots, plus the last validated stream command (not a hardware acknowledgement). Older reports lack this timing detail; observation-time differences cannot establish exact instantaneous velocity. Diagnostic metadata does not change stop thresholds or qualify normal execution.
+
+New commissioning reports additionally include per-sample packet ages, packet skew, motion status, controller-command monotonic timestamps, and aggregate maximum age/skew/command-gap metrics. These identify whether a failed hold coincided with delayed CAN feedback or a bridge scheduling gap.
+
+After the stationary hold test succeeds, use the separate, single-use commissioning command:
+
+```bash
+sudo ./scripts/nero_ros2.sh commission-abort nero-agent.local.json \
+  --output reports/agent-moving-abort.json
+```
+
+Use an enabled, stationary arm, mechanically supported against falling while allowing the small test motion. Stop other controllers, clear the workspace, and review the actual tool and collision scene (`reviewed_hardware=true`). The test plans a fixed **+0.01 rad joint1 target** with MoveIt, using 0.02 rad/s and 0.05 rad/s² planning caps. It prompts for **`SUPPORTED ABORT`** before opening a separate restricted gate. No `--execute`, LLM, reset, enable, automatic return, or retry is involved. Repository code is mounted into Docker, so this change needs no image rebuild.
+
+The driver automatically blocks streaming and initiates the MOVE J hold after two advancing feedback samples show at least +0.0005 rad displacement and +0.005 rad/s joint1 velocity. The trial also aborts on a four-second trigger deadline or its tighter measured bounds: 0.03 rad/s, 0.012 rad overall excursion, and 0.002 rad excursion on other joints. These are detection thresholds, not guaranteed physical limits.
+
+The JSON report includes the trigger state, feedback trace, cancellation result, additional travel, and time to sustained standstill. `passed` requires acknowledged controller cancellation, standstill within one second of the trigger, no more than 0.01 rad additional excursion on any joint, and two seconds of fresh enabled holding feedback within 0.002 rad of the hold target and at or below 0.003 rad/s. Exceeding the observed speed bound also fails. `inconclusive` means the deliberate moving abort was not established, including reaching the goal region or completing without a trigger. Failed and inconclusive trials return a nonzero exit code.
+
+This observes one supported trial; it does not guarantee deceleration or unlock normal hardware execution. The gate remains latched, and no damping/disable fallback is added. The wrapper ends monitoring when it cleans up the ROS stack after the test, leaving the last holding target in the controller. Review the report and physical behavior before another trial.
+
 ### Hardware capture, planning, and supervised execution
 
 ```bash
@@ -57,9 +134,19 @@ sudo ./scripts/nero_ros2.sh hardware nero-agent.local.json --scripted --execute 
 
 Each physical motion requires typing `EXECUTE`. Start with the deterministic test before using LLM choices. A failure ends the sequence without an automatic return or retry. Initial hardware testing must establish tracking and stop behavior; this bridge has not yet been physically validated.
 
-Plans use 0.08 rad/s velocity and 0.15 rad/s² acceleration caps, with a 0.15 rad maximum excursion from the captured start. The controller streams timed positions using SDK `move_js`; it does not split the path into separately planned `move_j` moves. The bridge retains the 0.10 rad/s measured-velocity guard, fresh-feedback checks, tracking bounds, and a command/heartbeat watchdog. It reuses the pinned SDK and firmware-specific acceleration encoding/readback correction. These checks can reject a trajectory; they do not establish physical tracking performance in advance.
+Plans use 0.08 rad/s velocity and 0.15 rad/s² acceleration caps, with a 0.15 rad maximum excursion from the captured start. MoveIt sends the timed trajectory to the ROS2 `joint_trajectory_controller`; the hardware bridge forwards controller position targets through the vendor's ordinary `move_j` position interface. The unsmoothed instantaneous SDK `move_js` interface is not used for trajectory execution. The bridge retains the 0.10 rad/s measured-velocity guard, fresh-feedback checks, tracking bounds, and a command/heartbeat watchdog. It reuses the pinned SDK and firmware-specific acceleration encoding/readback correction. These checks can reject a trajectory; they do not establish physical tracking performance in advance.
 
-For an already running stack, `python3 -m nero_agent stop --config nero-agent.local.json` requests an electronic stop and cancels the active action from the same sourced ROS environment and domain (default `ROS_DOMAIN_ID=73`). Stop delivery is reported separately from measured standstill. Keep the physical emergency stop available during initial trials.
+After a moving-abort qualification passes, supply that report explicitly for hardware execution:
+
+```bash
+sudo ./scripts/nero_ros2.sh hardware nero-agent.local.json --scripted --execute \
+  --abort-qualification-report reports/agent-moving-abort-controller-synchronized.json \
+  --output reports/agent-execution.json
+```
+
+The client verifies the report records a passed commissioning trial, acknowledged cancellation, and sustained powered holding before it opens the execution path. A missing, malformed, or failed report remains blocked.
+
+For an already running stack, use the controlled-abort command described above from the same sourced ROS environment and domain (default `ROS_DOMAIN_ID=73`). Its result distinguishes controller cancellation from observed holding.
 
 For a native Humble environment with the dependencies and pinned vendor packages from [ros2/Dockerfile](ros2/Dockerfile) installed and sourced:
 

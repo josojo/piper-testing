@@ -21,7 +21,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('doctor', help='Check local ROS Python imports without connecting to hardware')
-    for name in ('run', 'capture', 'stop'):
+    for name in ('run', 'capture', 'stop', 'validate-hold', 'commission-abort'):
         p = sub.add_parser(name)
         p.add_argument('--config', type=Path, default=ROOT / 'examples/nero-agent.mock.json')
         p.add_argument('--output', type=Path, default=ROOT / ('reports/agent-' + name + '.json'))
@@ -32,6 +32,8 @@ def main(argv=None):
             choice.add_argument('--scripted', action='store_true', help='Fixed inspection/start sequence instead of LLM')
             p.add_argument('--model')
             p.add_argument('--execute', action='store_true', help='Execute plans; hardware requires per-action confirmation')
+            p.add_argument('--abort-qualification-report', type=Path,
+                           help='Passed moving-abort report required for hardware execution')
             p.add_argument('--max-actions', type=int, default=8)
     args = parser.parse_args(argv)
     if args.command == 'doctor':
@@ -46,10 +48,25 @@ def main(argv=None):
         if args.output.resolve() == args.config.resolve():
             raise AgentError('Output must not overwrite configuration')
         settings = Settings.parse(strict_json(args.config.read_text()),
-                                  require_review=getattr(args, 'execute', False))
+                                  require_review=args.command == 'commission-abort' or getattr(args, 'execute', False))
+        if args.command == 'commission-abort':
+            from dataclasses import replace
+            if settings.mode != 'hardware':
+                raise AgentError('commission-abort requires hardware configuration')
+            settings = replace(settings, max_velocity=.02, max_acceleration=.05, max_excursion=.012, timeout=4., tolerance=.000501)
         offline = getattr(args, 'offline_demo', False)
         if offline and (settings.mode != 'mock' or args.execute):
             raise AgentError('--offline-demo forbids --execute and hardware configuration')
+        if settings.mode == 'hardware' and getattr(args, 'execute', False):
+            from .abort_policy import require_verified_controlled_abort
+            require_verified_controlled_abort(args.abort_qualification_report)
+        if args.command == 'validate-hold':
+            if settings.mode != 'hardware':
+                raise AgentError('validate-hold requires hardware configuration')
+            if input('Experimental MOVE J hold test: mechanically support the arm, clear the workspace, '
+                     'and stop other controllers. This sends a position command and can move the arm. '
+                     'Type SUPPORTED HOLD to proceed: ').strip() != 'SUPPORTED HOLD':
+                raise AgentError('Hold validation cancelled; no hold command sent')
         if getattr(args, 'max_actions', 8) not in range(1, 33):
             raise AgentError('max-actions must be between 1 and 32')
         report.update(mode='offline' if offline else settings.mode,
@@ -61,7 +78,8 @@ def main(argv=None):
             backend = OfflineBackend(settings)
         else:
             from .ros_backend import RosBackend
-            backend = RosBackend(settings, require_ready=args.command != 'stop')
+            backend = RosBackend(settings, require_ready=args.command != 'stop',
+                                 qualification_report=getattr(args, 'abort_qualification_report', None))
         def record(event):
             if event['event'] == 'execution_pending' and backend.hardware:
                 report['hardware_motion_may_have_occurred'] = True
@@ -69,10 +87,37 @@ def main(argv=None):
             write_report(args.output, report)
             if event['event'] in ('decision', 'planned', 'action_result'):
                 print('%s: %s' % (event['event'], event.get('pose') or event.get('action') or event.get('status')), file=sys.stderr)
-        if args.command == 'capture':
+        if args.command == 'commission-abort':
+            from .commissioning import CRITERIA
+            before = backend.state()
+            if max(map(abs, before['velocities_rad_s'])) > .003:
+                raise AgentError('Commissioning requires a stationary arm')
+            goal = list(before['joints_rad'])
+            goal[0] += .01
+            plan = backend.plan(goal)
+            report.update(initial_state=before, plan=plan, criteria=CRITERIA,
+                          validation_scope='Single supported moving-abort observation; normal execution remains blocked')
+            write_report(args.output, report)
+            if input('Moving-abort test: joint1 target +0.01 rad, planned speed <=0.02 rad/s. '
+                     'Mechanically support the arm without obstructing this motion; clear the workspace. '
+                     'No automatic return. Type SUPPORTED ABORT to move: ').strip() != 'SUPPORTED ABORT':
+                raise AgentError('Moving-abort test cancelled')
+            report['hardware_motion_may_have_occurred'] = True
+            write_report(args.output, report)
+            report.update(backend.commission_abort(plan))
+        elif args.command == 'capture':
             report.update(status='captured', state=backend.state())
-        elif args.command == 'stop':
+        elif args.command in ('stop', 'validate-hold'):
+            if args.command == 'validate-hold':
+                before = backend.state()
+                report['initial_state'] = before
+                if max(map(abs, before['velocities_rad_s'])) > 0.01:
+                    raise AgentError('Supported hold validation must start with a stationary arm')
+            report['hardware_motion_may_have_occurred'] = backend.hardware
+            write_report(args.output, report)
             report.update(backend.stop())
+            if args.command == 'validate-hold':
+                report['validation_scope'] = 'Position hold only; not a moving-trajectory abort qualification'
         else:
             if offline or args.scripted:
                 chooser = ScriptedChooser()
@@ -89,10 +134,12 @@ def main(argv=None):
                 report['status'] = 'offline_demo_passed'
         write_report(args.output, report)
         print(json.dumps({'status': report['status'], 'mode': report['mode'], 'report': str(args.output)}))
-        return 0
+        return 2 if args.command == 'commission-abort' and report['status'] != 'passed' else 0
     except (Exception, KeyboardInterrupt) as error:
         report.update(status='rejected_or_aborted', reason=str(error) or type(error).__name__)
         if backend is not None:
+            if getattr(backend, 'last_stop_result', None) is not None:
+                report['controlled_abort'] = backend.last_stop_result
             try:
                 # Do not send an unsolicited hardware stop for a read-only planning error.
                 if getattr(backend, 'motion_pending', False):

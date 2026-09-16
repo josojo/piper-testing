@@ -4,9 +4,6 @@
 from copy import deepcopy
 import time
 
-from nero_safety_common import connect_nero, disconnect_nero
-
-
 STARTUP_TIMEOUT = 15.0
 RESET_TIMEOUT = 5.0
 
@@ -49,6 +46,7 @@ def wait_for_status(robot, timeout):
 
 
 def main():
+    from nero_safety_common import connect_nero, disconnect_nero
     robot = None
     try:
         print("Connecting to Nero...")

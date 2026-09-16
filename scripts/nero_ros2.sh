@@ -9,7 +9,7 @@ case "$operation" in
   build)
     exec docker build --tag "$image_name" --file "$repo_root/ros2/Dockerfile" "$repo_root/ros2"
     ;;
-  demo|hardware|capture)
+  demo|hardware|capture|validate-hold|commission-abort|diagnose-feedback|diagnose-feedback-stack)
     if ! docker info >/dev/null 2>&1; then
       echo 'Docker is unavailable or access is denied. Run this script with sudo, or use a ROS Humble environment directly. See README.' >&2
       exit 2
@@ -41,6 +41,22 @@ case "$operation" in
     case "$config_path" in "$repo_root/"*) ;; *) echo 'Config must be inside the repository' >&2; exit 2;; esac
     config_path="/work/${config_path#"$repo_root/"}"
     runtime+=(--network host --env "NERO_CAN_CHANNEL=${NERO_CAN_CHANNEL:-can0}")
+    if [[ "$operation" == diagnose-feedback-stack ]]; then
+      exec docker run "${runtime[@]}" "$image_name" python3 -m nero_agent.bringup \
+        --config "$config_path" --diagnose-feedback "$@"
+    fi
+    if [[ "$operation" == diagnose-feedback ]]; then
+      exec docker run "${runtime[@]}" "$image_name" python3 -m nero_agent.feedback_diagnostic \
+        --config "$config_path" "$@"
+    fi
+    if [[ "$operation" == commission-abort ]]; then
+      exec docker run "${runtime[@]}" "$image_name" python3 -m nero_agent.bringup \
+        --config "$config_path" --commission-abort "$@"
+    fi
+    if [[ "$operation" == validate-hold ]]; then
+      exec docker run "${runtime[@]}" "$image_name" python3 -m nero_agent.bringup \
+        --config "$config_path" --validate-hold "$@"
+    fi
     if [[ "$operation" == capture ]]; then
       exec docker run "${runtime[@]}" "$image_name" python3 -m nero_agent.bringup \
         --config "$config_path" --capture-only "$@"
@@ -48,6 +64,6 @@ case "$operation" in
     exec docker run "${runtime[@]}" "$image_name" python3 -m nero_agent.bringup --config "$config_path" "$@"
     ;;
   *)
-    echo "Usage: $0 build | demo [--scripted | --instruction TEXT] | capture CONFIG | hardware CONFIG [--scripted] [--execute]"
+    echo "Usage: $0 build | demo [--scripted | --instruction TEXT] | capture CONFIG | validate-hold CONFIG | commission-abort CONFIG | diagnose-feedback CONFIG [--duration 30] | diagnose-feedback-stack CONFIG [--duration 30] | hardware CONFIG [--scripted] [--execute]"
     ;;
 esac

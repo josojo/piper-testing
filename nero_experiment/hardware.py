@@ -67,6 +67,8 @@ class ArmState:
     flange_pose_m_rad: tuple
     feedback_timestamps: tuple
     captured_at_unix: float
+    joint_position_timestamps: tuple = ()
+    motor_velocity_timestamps: tuple = ()
 
     def to_dict(self):
         return {"source": "hardware_feedback", **asdict(self)}
@@ -160,7 +162,7 @@ class NeroHardware:
             raise PlanningError(f"Arm reports unsafe state/error: {state_code}/{status.err_code}")
         if int(status.ctrl_mode) not in (0, 1):
             raise PlanningError("Arm must be in standby or CAN mode; other control sources are not supported")
-        enabled, velocities = [], []
+        enabled, velocities, motor_timestamps = [], [], []
         for index in range(1, 8):
             driver = fresh(self.robot.get_driver_states(index), f"joint {index} driver")
             foc = driver.foc_status
@@ -170,6 +172,7 @@ class NeroHardware:
                     raise PlanningError(f"Joint {index} driver fault: {flag}")
             enabled.append(bool(foc.driver_enable_status))
             motor = fresh(self.robot.get_motor_states(index), f"joint {index} motor")
+            motor_timestamps.append(timestamps[-1])
             velocities.append(motor.velocity)
         velocities = vector(velocities, 7, "measured velocities")
         if require_enabled and (state_code != 0 or not all(enabled)):
@@ -192,7 +195,8 @@ class NeroHardware:
                 f"Joint feedback timing rejected: skew={skew * 1000:.1f} ms (limit 20 ms); "
                 f"ages [{detail}] (limit 50 ms)")
         return ArmState(tuple(q), tuple(velocities), tuple(enabled), state_code, int(status.motion_status),
-                        tuple(flange), tuple(timestamps), self.wall_clock())
+                        tuple(flange), tuple(timestamps), self.wall_clock(),
+                        joint_timestamps, tuple(motor_timestamps))
 
     def stationary(self, require_enabled=False, timeout=5.0):
         deadline, stable_since, first = self.clock() + timeout, None, None

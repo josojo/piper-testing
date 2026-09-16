@@ -12,7 +12,7 @@ from .core import AgentError, JOINTS, distance, vector
 
 
 class RosBackend:
-    def __init__(self, settings, require_ready=True):
+    def __init__(self, settings, require_ready=True, qualification_report=None):
         try:
             import rclpy
             from rclpy.action import ActionClient
@@ -26,6 +26,7 @@ class RosBackend:
                              'see python -m nero_agent doctor') from error
         self.rclpy, self.settings = rclpy, settings
         self.hardware = settings.mode == 'hardware'
+        self.qualification_report = qualification_report
         self.source = 'hardware_feedback' if self.hardware else 'ros2_mock_feedback'
         self.motion_pending = False
         self.goal_handle = None
@@ -54,6 +55,10 @@ class RosBackend:
             self.info = self.node.create_client(Trigger, ns + '/project/info')
             self.gate = self.node.create_client(SetBool, ns + '/project/control_enable')
             self.estop = self.node.create_client(Trigger, ns + '/project/stop')
+            self.abort_status = self.node.create_client(Trigger, ns + '/project/abort_status')
+            self.abort_report = self.node.create_client(Trigger, ns + '/project/abort_report')
+            self.last_status_poll = 0.0
+            self.full_abort_report = None
             self.planner = self.node.create_client(GetMotionPlan, ns + '/plan_kinematic_path')
             self.apply = self.node.create_client(ApplyPlanningScene, ns + '/apply_planning_scene')
             self.scene = self.node.create_client(GetPlanningScene, ns + '/get_planning_scene')
@@ -203,8 +208,8 @@ class RosBackend:
         motion.allowed_planning_time = 5.0
         motion.num_planning_attempts = 1
         # Launch config sets absolute caps to 0.08 rad/s and 0.15 rad/s².
-        motion.max_velocity_scaling_factor = 1.0
-        motion.max_acceleration_scaling_factor = 1.0
+        motion.max_velocity_scaling_factor = min(1.0, self.settings.max_velocity / .08)
+        motion.max_acceleration_scaling_factor = min(1.0, self.settings.max_acceleration / .15)
         motion.start_state.is_diff = True
         motion.start_state.joint_state.name = list(JOINTS) + ['gripper']
         motion.start_state.joint_state.position = list(before['joints_rad']) + [before['gripper_width_m']]
@@ -225,6 +230,9 @@ class RosBackend:
                 'start': before['joints_rad'], 'goal': list(goal), **summary}
 
     def execute(self, plan):
+        if self.hardware:
+            from .abort_policy import require_verified_controlled_abort
+            require_verified_controlled_abort(getattr(self, 'qualification_report', None))
         from std_srvs.srv import SetBool
         from moveit_msgs.action import ExecuteTrajectory
         from moveit_msgs.msg import MoveItErrorCodes
@@ -254,6 +262,7 @@ class RosBackend:
                 if (distance(current['joints_rad'], before['joints_rad']) > 0.005
                         or abs(current['gripper_width_m'] - before['gripper_width_m']) > 0.001):
                     raise AgentError('Arm or gripper changed during hardware setup; re-plan')
+                self._sync_trajectory_start(trajectory, current, goal)
             request = ExecuteTrajectory.Goal(trajectory=trajectory)
             self.pending_goal = self.executor.send_goal_async(request)
             self.goal_handle = self._wait(self.pending_goal, monitor=True)
@@ -288,15 +297,107 @@ class RosBackend:
             self.stop()
             raise
 
+    def commission_abort(self, plan):
+        """One bounded trial. The driver triggers and observes the abort independently."""
+        from std_srvs.srv import Trigger
+        from moveit_msgs.action import ExecuteTrajectory
+        from .commissioning import validate_trial_plan
+        if not self.hardware:
+            raise AgentError('Moving-abort commissioning requires hardware')
+        saved = self.plans.pop(plan.get('token'), None)
+        if saved is None:
+            raise AgentError('Unknown or already consumed commissioning plan')
+        trajectory, before, goal, digest = saved
+        validate_trial_plan(trajectory.joint_trajectory, before['joints_rad'])
+        def check_start():
+            current = self.state()
+            if (distance(current['joints_rad'], before['joints_rad']) > .0005
+                    or max(map(abs, current['velocities_rad_s'])) > .003
+                    or abs(current['gripper_width_m'] - before['gripper_width_m']) > .001):
+                raise AgentError('Commissioning start changed or is moving; re-plan')
+            return current
+        check_start()
+        if self._scene_digest() != digest:
+            raise AgentError('Planning scene changed; re-plan')
+        if not self.executor.wait_for_server(timeout_sec=5):
+            raise AgentError('MoveIt execution action unavailable')
+        gate_client = self.node.create_client(Trigger, self.settings.namespace + '/project/commission_abort')
+        self.motion_pending = True
+        try:
+            gate = self._call(gate_client, Trigger.Request())
+            if not gate.success:
+                raise AgentError('Commissioning gate rejected: ' + gate.message)
+            self.sample = None
+            current = check_start()
+            self._sync_trajectory_start(trajectory, current, goal)
+            self.pending_goal = self.executor.send_goal_async(ExecuteTrajectory.Goal(trajectory=trajectory))
+            self.goal_handle = self._wait(self.pending_goal, timeout=2)
+            self.pending_goal = None
+            if not self.goal_handle.accepted:
+                raise AgentError('MoveIt rejected commissioning trajectory')
+            completed = self.goal_handle.get_result_async()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                response = self.poll_abort_status()
+                observed = json.loads(response.message)
+                self.last_stop_result = observed
+                if observed['status'] != 'idle':
+                    break
+                if completed.done():
+                    # An ordinary completion is not a successful moving abort.
+                    break
+                self._fresh()
+                self._spin()
+            stopped = self.stop()
+            result = stopped['controlled_abort'].get('commissioning', {})
+            if result.get('status') in ('pending', 'triggered'):
+                result['status'] = 'inconclusive'
+                result['reason'] = 'No confirmed moving abort before trajectory completion/deadline'
+            return {'status': result.get('status', 'failed'), 'commissioning': result,
+                    'controlled_abort': stopped['controlled_abort']}
+        except BaseException:
+            self.stop()
+            raise
+        finally:
+            self.node.destroy_client(gate_client)
+
+    def poll_abort_status(self):
+        from std_srvs.srv import Trigger
+        # Continue spinning feedback/heartbeat while limiting requests to 10 Hz.
+        deadline = getattr(self, 'last_status_poll', 0.) + .1
+        while time.monotonic() < deadline:
+            self._spin()
+        self.last_status_poll = time.monotonic()
+        return self._call(self.abort_status, Trigger.Request(), timeout=1.)
+
+    def fetch_abort_report(self, observed):
+        from std_srvs.srv import Trigger
+        if (getattr(self, 'full_abort_report', None) is not None
+                and self.full_abort_report.get('status') == observed.get('status')):
+            self.last_stop_result = self.full_abort_report
+            return self.full_abort_report
+        response = self._call(self.abort_report, Trigger.Request(), timeout=2.)
+        if not response.success:
+            raise AgentError('Full abort report unavailable: ' + response.message)
+        self.full_abort_report = json.loads(response.message)
+        self.last_stop_result = self.full_abort_report
+        return self.full_abort_report
+
     def stop(self):
         from std_srvs.srv import Trigger
         errors = []
-        # Hardware stop is attempted before ROS cancellation can block.
+        # Driver atomically latches streaming off and requests controller cancellation.
+        # Its timer then issues the hold and monitors independently of this client.
         if self.hardware:
             try:
                 result = self._call(self.estop, Trigger.Request(), timeout=2)
                 if not result.success:
-                    errors.append(result.message)
+                    try:
+                        detail = json.loads(result.message)
+                        self.last_stop_result = detail
+                        errors.append(detail.get('failure') or detail.get('reason') or 'Driver stop failed')
+                    except (ValueError, AttributeError):
+                        errors.append(result.message)
             except Exception as error:
                 errors.append(str(error))
         if self.pending_goal is not None:
@@ -310,11 +411,50 @@ class RosBackend:
                 self._wait(self.goal_handle.cancel_goal_async(), timeout=2)
             except Exception as error:
                 errors.append(str(error))
+        observed = None
+        if self.hardware:
+            try:
+                deadline = time.monotonic() + 7.0
+                while time.monotonic() < deadline:
+                    response = self.poll_abort_status()
+                    observed = json.loads(response.message)
+                    self.last_stop_result = observed
+                    if observed['status'] in ('holding', 'failed'):
+                        observed = self.fetch_abort_report(observed)
+                    if observed['status'] == 'failed':
+                        raise AgentError(observed.get('failure') or 'Controlled abort failed')
+                    if observed['status'] == 'holding':
+                        break
+                    self._spin()
+                else:
+                    raise AgentError('Controlled abort observation timed out')
+            except Exception as error:
+                errors.append(str(error))
         if errors:
             raise AgentError('Stop could not be confirmed: ' + '; '.join(errors))
         self.motion_pending = False
         self.goal_handle = None
-        return {'status': 'stop_requested', 'source': self.source}
+        return {'status': 'holding_observed' if self.hardware else 'stop_requested',
+                'source': self.source, 'controlled_abort': observed}
+
+    def _sync_trajectory_start(self, trajectory, current, goal):
+        """Align the first controller point with fresh measured feedback."""
+        from .trajectory import validate_trajectory
+        joint_trajectory = getattr(trajectory, 'joint_trajectory', None)
+        # Lightweight backend tests use an opaque trajectory placeholder; the
+        # real MoveIt action always supplies a JointTrajectory message.
+        if joint_trajectory is None:
+            return
+        if not hasattr(joint_trajectory, 'points'):
+            return
+        if not joint_trajectory.points:
+            raise AgentError('MoveIt trajectory has no points')
+        joint_trajectory.points[0].positions = list(current['joints_rad'])
+        try:
+            validate_trajectory(joint_trajectory, current['joints_rad'], goal,
+                                self.initial, self.settings)
+        except Exception as error:
+            raise AgentError('Synchronized trajectory start is invalid: ' + str(error))
 
     def close(self):
         if self.callback_executor is not None:

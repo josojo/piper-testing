@@ -38,9 +38,38 @@ def stop_processes(processes):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
-    parser.add_argument('--capture-only', action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--diagnose-feedback', action='store_true')
+    mode.add_argument('--commission-abort', action='store_true')
+    mode.add_argument('--capture-only', action='store_true')
+    mode.add_argument('--validate-hold', action='store_true')
     args, remaining = parser.parse_known_args()
-    settings = Settings.parse(strict_json(args.config.read_text()), require_review='--execute' in remaining)
+    settings = Settings.parse(strict_json(args.config.read_text()), require_review=args.commission_abort or '--execute' in remaining)
+    if settings.mode == 'hardware' and '--execute' in remaining:
+        from .abort_policy import require_verified_controlled_abort
+        try:
+            qualification = None
+            if '--abort-qualification-report' in remaining:
+                index = remaining.index('--abort-qualification-report')
+                if index + 1 < len(remaining):
+                    qualification = remaining[index + 1]
+            require_verified_controlled_abort(qualification)
+        except Exception as error:
+            print(str(error), file=sys.stderr)
+            return 2
+    diagnostic_args = None
+    if args.diagnose_feedback:
+        import math
+        diagnostic_parser = argparse.ArgumentParser()
+        diagnostic_parser.add_argument('--duration', type=float, default=30.)
+        diagnostic_parser.add_argument('--output', type=Path, default=ROOT / 'reports/agent-feedback-stack.json')
+        diagnostic_args = diagnostic_parser.parse_args(remaining)
+        if settings.mode != 'hardware' or not math.isfinite(diagnostic_args.duration) or not 1 <= diagnostic_args.duration <= 120:
+            parser.error('Full-stack diagnostic requires hardware config and duration between 1 and 120 seconds')
+        if diagnostic_args.output.resolve() == args.config.resolve():
+            parser.error('Output must not overwrite configuration')
+        from .__main__ import write_report
+        write_report(diagnostic_args.output, {'status': 'starting', 'motion_commands_sent': False})
     processes = []
     logs = []
     initial_file = None
@@ -53,6 +82,16 @@ def main():
             ['ros2', 'launch', str(ROOT / 'ros2/nero.launch.py'), 'mode:=' + settings.mode,
              'namespace:=' + settings.namespace.strip('/')],
         ]
+        if args.diagnose_feedback:
+            commands[0].extend(['--diagnose-feedback', '--diagnostic-duration', str(diagnostic_args.duration)])
+        if args.commission_abort:
+            if settings.mode != 'hardware':
+                raise RuntimeError('Commissioning requires hardware configuration')
+            commands[0].append('--commission-abort')
+        if settings.mode == 'hardware' and '--execute' in remaining and '--abort-qualification-report' in remaining:
+            index = remaining.index('--abort-qualification-report')
+            if index + 1 < len(remaining):
+                commands[0].extend(['--abort-qualification-report', remaining[index + 1]])
         from .ros_backend import RosBackend
         for index, cmd in enumerate(commands):
             if index == 1 and settings.mode == 'hardware':
@@ -100,12 +139,19 @@ def main():
         else:
             raise RuntimeError('ROS stack did not become ready: ' + last_error + '; inspect reports/ros2-*.log')
         print('ROS 2 + MoveIt ready (%s, gripper modeled, arm-only commands).' % settings.mode, flush=True)
+        if args.diagnose_feedback:
+            from .feedback_diagnostic import full_stack
+            return full_stack(settings, diagnostic_args.output, diagnostic_args.duration, processes)
         from .__main__ import main as cli
-        command = 'capture' if args.capture_only else 'run'
+        command = 'commission-abort' if args.commission_abort else 'validate-hold' if args.validate_hold else ('capture' if args.capture_only else 'run')
         return cli([command, '--config', str(args.config)] + remaining)
     except KeyboardInterrupt:
+        if diagnostic_args:
+            write_report(diagnostic_args.output, {'status': 'interrupted', 'motion_commands_sent': False})
         return 130
     except Exception as error:
+        if diagnostic_args:
+            write_report(diagnostic_args.output, {'status': 'diagnostic_failed', 'reason': str(error), 'motion_commands_sent': False})
         print(str(error), file=sys.stderr)
         return 2
     finally:

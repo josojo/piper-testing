@@ -121,6 +121,19 @@ def fake_hardware(q):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_named_feedback_timestamps_match_checked_packets(self):
+        hardware = fake_hardware(DEMO_START)
+        original = hardware.robot.get_motor_states
+        def motor(index):
+            packet = original(index)
+            packet.timestamp -= index * .001
+            return packet
+        with patch.object(hardware.robot, 'get_motor_states', side_effect=motor):
+            state = hardware.read()
+        self.assertEqual(state.joint_position_timestamps, state.feedback_timestamps[:4])
+        self.assertEqual(state.motor_velocity_timestamps, state.feedback_timestamps[6:19:2])
+        self.assertEqual(len(set(state.motor_velocity_timestamps)), 7)
+
     def test_stationary_recovers_from_one_incoherent_snapshot(self):
         hardware = fake_hardware(DEMO_START)
         hardware.robot._parser.joint_12.timestamp -= 0.03

@@ -384,7 +384,20 @@ class RosExecutionTests(unittest.TestCase):
         self.assertEqual(b.stop_calls, [True])
         self.assertNotIn('test', b.plans)
 
-    def test_hardware_setup_requires_new_unchanged_feedback_before_sending(self):
+    def test_unverified_abort_blocks_execution_before_any_backend_action(self):
+        b = self.backend()
+        b.hardware = True
+        b.state = MagicMock()
+        b.executor.send_goal_async = MagicMock()
+        with self.assertRaisesRegex(AgentError, 'powered controlled abort'):
+            b.execute({'token': 'test'})
+        b.state.assert_not_called()
+        b.executor.send_goal_async.assert_not_called()
+        self.assertFalse(b.motion_pending)
+        self.assertEqual(b.stop_calls, [])
+
+    @patch('nero_agent.abort_policy.require_verified_controlled_abort')
+    def test_hardware_setup_requires_new_unchanged_feedback_before_sending(self, capability):
         for failure in ('stale', 'moved', 'gripper'):
             b = self.backend()
             b.hardware, b.gate = True, object()
@@ -410,7 +423,8 @@ class RosExecutionTests(unittest.TestCase):
             b.executor.send_goal_async.assert_not_called()
             self.assertEqual(b.stop_calls, [True])
 
-    def test_hardware_setup_refreshes_feedback_before_action_submission(self):
+    @patch('nero_agent.abort_policy.require_verified_controlled_abort')
+    def test_hardware_setup_refreshes_feedback_before_action_submission(self, capability):
         b = self.backend()
         b.hardware, b.gate = True, object()
         initial = b.state()
