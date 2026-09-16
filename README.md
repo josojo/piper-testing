@@ -1,380 +1,136 @@
-# Astra-to-Nero MuJoCo Control Stack
+# LLM-directed NERO arm with ROS 2 and MoveIt 2
 
-This repository is a starting point for controlling an AgileX NERO arm from a vision-capable model such as Astra.
+This project aims to let an AgileX NERO arm carry out natural-language instructions. An LLM chooses actions through a small set of Python tools; MoveIt 2 plans motion; a ROS 2 controller and NERO driver execute it; measured state and task results inform the LLM's next decision.
 
-The intended architecture is:
+**Project direction:** use Python for the LLM application and tool validation, ROS 2 + MoveIt 2 for planning and execution, and MuJoCo as an optional physics testing environment.
 
-```text
-Astra / vision
-        ↓
-desired end-effector pose
-        ↓
-Python target planner
-        ↓
-MuJoCo
-  - inverse kinematics
-  - trajectory generation
-  - collision checking
-  - joint-limit checking
-        ↓
-validated joint trajectory
-        ↓
-pyAgxArm / NERO
-        ↓
-real robot
+**Implementation status:** this architecture is the migration target, not an implemented ROS 2 integration. The repository currently contains a custom MuJoCo planner, an OpenRouter upright-and-return experiment, and direct Python/CAN hardware utilities. Their existing commands are retained below as experimental reference. This README change does not install ROS 2 or alter hardware execution.
+
+## Target architecture
+
+```mermaid
+flowchart TD
+    A["Your instruction"] --> B["LLM: choose actions"]
+    B --> C["Python tools: validate requests"]
+    C --> D["MoveIt 2: plan collision-checked motion"]
+    D --> E["ROS 2 controller + NERO driver"]
+    E --> F["Physical arm"]
+    F --> G["Measured state and task result"]
+    G --> B
 ```
 
-MuJoCo is used as the local robot model, geometry engine, trajectory validator, and eventually the simulation environment. `pyAgxArm` remains the hardware backend for the real NERO.
+The control loop is: observe the current state, select one action, validate and plan it, execute it, then report the measured result. The LLM does not schedule motor commands, solve inverse kinematics, or assume that a requested motion succeeded.
 
-## Design goals
+## Responsibilities
 
-- Keep the high-level control loop in Python.
-- Treat the vision model as a target selector, not as a motor controller.
-- Validate proposed motion before sending it to the real arm.
-- Start with discrete Cartesian target updates and visual re-checks.
-- Keep the real-hardware safety checks independent of the simulator.
-- Make it possible to test planning and collision behavior without powering the arm.
+| Layer | Responsibility |
+| --- | --- |
+| LLM | Interpret the instruction, choose an available action, and decide what to do after receiving its result. |
+| Python tools | Validate action names and arguments, enforce workspace/task constraints, manage task state, and return structured results. |
+| MoveIt 2 | Use the current robot state and planning scene to solve motion goals, check collisions, and produce trajectories with configured velocity and acceleration limits. |
+| ROS 2 controller + NERO driver | Execute the planned trajectory, expose measured state and execution status, and support cancellation and fault handling. |
+| Perception and transforms, added later | Locate objects, maintain scene geometry, and transform measured poses into known robot frames. |
+| MuJoCo, optional | Test physics, contact, grasping, and repeatable simulated scenarios when those capabilities are needed. |
 
-## Components
+Python remains the application language. MoveIt provides a [Python planning API (`moveit_py`)](https://moveit.picknik.ai/main/doc/examples/motion_planning_python_api/motion_planning_python_api_tutorial.html). AgileX provides a [NERO-compatible ROS 2 and MoveIt integration](https://github.com/agilexrobotics/agx_arm_ros/blob/ros2/src/agx_arm_moveit/README_EN.md), including a `FollowJointTrajectory` interface through `ros2_control`. These are the starting points for the migration; their behavior on this arm must be verified before adding LLM control.
 
-### 1. Astra / vision
+Only the selected execution backend should command the physical arm. The LLM and application tools must not bypass it through direct CAN or SDK calls. Existing direct-control scripts must not run alongside the ROS 2 motion controller.
 
-Astra receives camera images and task context and proposes a desired end-effector pose.
+## Python action interface
 
-The output should be a structured target, not free-form text:
+Start with a small set of tools backed by deterministic implementations:
+
+| Proposed tool | Purpose |
+| --- | --- |
+| `get_state()` | Return fresh measured joint state, robot status, and whether an action is active. |
+| `move_to_named_pose(name)` | Plan and execute a motion to a reviewed pose, starting from the measured state. |
+| `stop()` | Request cancellation/stop through the execution layer and report the observed outcome. |
+
+These are proposed interfaces, not commands currently implemented in this repository. A request could look like:
 
 ```json
 {
-  "frame": "nero_base",
-  "position_m": [0.35, -0.15, 0.20],
-  "orientation_xyzw": [0.0, 1.0, 0.0, 0.0],
-  "gripper": 1.0,
-  "reason": "Move above the red block before lowering"
+  "action": "move_to_named_pose",
+  "arguments": {"name": "inspection"}
 }
 ```
 
-The target is expressed in a known robot coordinate frame. If Astra initially returns image pixels, a separate perception/calibration stage must convert pixels into robot-frame coordinates before this interface.
+Each action should return its identifier, completion/failure status, reason, and latest measured state. Planning success, command acceptance, and physical completion are distinct outcomes. The next LLM decision should use physical feedback, not the last requested pose or simulated prediction.
 
-Astra should not send joint angles or CAN commands. It should make relatively infrequent, deliberate decisions such as:
+Allow one motion action at a time, with bounded execution time and explicit cancellation. Reject unknown tools, malformed arguments, unavailable poses, and stale state. A fault or cancellation ends the current motion sequence; it must not trigger an automatic return or blind retry.
 
-```text
-observe → choose target pose → execute a short move → observe again
-```
+Later, add pose and object-based tools such as `move_to_pose(...)`, `move_above(object_id, clearance_m)`, `pick(object_id)`, and `place(location_id)`. Object-based actions require perception, calibrated coordinate transforms, and grasp/task logic. The LLM may select an object identifier; the application resolves its measured position. [MoveIt Task Constructor](https://moveit.picknik.ai/main/doc/tutorials/pick_and_place_with_moveit_task_constructor/pick_and_place_with_moveit_task_constructor.html) is a candidate for staged manipulation skills.
 
-### 2. Python target planner
+## Migration milestones
 
-The target planner is the application-level layer between Astra and MuJoCo. It is responsible for:
+### 1. Establish the NERO ROS 2 planning environment
 
-- validating the target schema;
-- converting poses between coordinate frames;
-- limiting target-step size;
-- choosing approach, grasp, lift, and retreat waypoints;
-- selecting an IK seed from the measured robot state;
-- requesting one or more candidate trajectories;
-- rejecting targets that are clearly outside the workspace;
-- sending only validated trajectories to the hardware adapter.
+- Select and document a ROS 2/MoveIt release supported by the vendor integration and host environment.
+- Bring up the vendor NERO model and MoveIt demo without hardware motion.
+- Verify the seven joint names, joint conventions, limits, base/tool frames, and actual tool geometry.
+- Add the table and known obstacles to the planning scene.
 
-The planner should maintain two kinds of state:
+**Acceptance:** a deterministic goal can be planned and previewed against the reviewed model and scene. No LLM is involved.
 
-```text
-real_state:
-  measured NERO joint positions, status, gripper state, errors
+### 2. Execute one verified motion from Python
 
-simulation_state:
-  MuJoCo state synchronized from real_state and used for planning
-```
+- Connect measured NERO feedback to the planning and execution stack.
+- Plan a small motion from the current physical state and execute it under supervision.
+- Check measured tracking, final pose, timeouts, cancellation, and fault handling.
+- Verify that the driver follows the planned timing and that speed/acceleration settings have the intended physical effect.
 
-The simulation state is a planning model. It is not assumed to be a perfect copy of the physical arm.
+**Acceptance:** one Python action reliably reports physical completion or a specific failure. Repeatedly splitting a trajectory into independent stop-and-settle SDK commands is not the target execution design.
 
-### 3. MuJoCo model
+### 3. Connect the LLM to the working tools
 
-The MuJoCo model should contain:
+- Expose state, named-pose motion, and stop tools with strict request validation.
+- Execute one action and return measured feedback before requesting the next decision.
+- Test instructions such as “move to the inspection pose, then return to the start.”
+- Log instructions, tool calls, plans, measured results, and rejection reasons.
 
-- the seven NERO joints;
-- joint limits and nominal velocity limits;
-- link frames and inertial parameters;
-- a named end-effector site;
-- simplified collision geometries for the links and gripper;
-- the table/platform;
-- known fixed obstacles;
-- optional cameras and lighting for synthetic observations.
+**Acceptance:** the LLM completes simple multi-action instructions and handles a rejected action without bypassing validation or issuing uncontrolled retries.
 
-Use a separate collision model rather than relying on detailed visual meshes. Boxes, capsules, cylinders, and convex meshes are easier to debug and usually better for fast collision checks.
+### 4. Add perception and manipulation
 
-MuJoCo's native model format is MJCF. Its Python bindings expose forward kinematics, contacts, joint state, actuator state, and simulation stepping. Collision detection produces contacts in `mjData.contact`; the number of active contacts is available through `data.ncon`.
+- Calibrate cameras and robot coordinate transforms.
+- Track objects and update planning-scene obstacles from observations.
+- Add reusable approach, grasp, lift, and place skills, with appropriate end-effector feedback.
+- Evaluate task success using observations and measured state.
 
-MuJoCo is a physics and contact engine, not a complete motion planner. The project must still choose or implement the IK and path-generation method.
+**Acceptance:** an object-based instruction can be resolved into verified actions and its result can be observed.
 
-### 4. Inverse kinematics
+### 5. Expand simulation where it helps
 
-Given a desired end-effector pose, IK finds a joint configuration that reaches it:
+Use MuJoCo for contact-rich tasks, grasp experiments, synthetic observations, and repeatable regression scenarios. Where practical, use the same application tool contracts for simulated and physical backends. Simulation is optional for the first ROS 2 motion milestone.
 
-```text
-desired pose → q_target[0:7]
-```
+## Role of simulation and execution checks
 
-The first implementation should use a differential or numerical IK solver with:
+The original idea of testing motion in simulation remains useful. A simulation pass alone does not establish how the physical arm will move: model geometry, calibration, payload, controller behavior, and feedback timing all matter.
 
-- the current measured joint configuration as the seed;
-- joint-position limits;
-- optional joint-velocity limits;
-- position and orientation tolerances;
-- a penalty for large joint motion;
-- collision avoidance where available.
+The current experimental executor validates a timed MuJoCo trajectory but executes separate controller-interpolated `move_j` microsteps. That does not preserve the simulated timing. The new architecture should validate the complete path from a MoveIt plan through controller execution to measured motion.
 
-Potential Python options include:
+MoveIt can provide [trajectory timing and optional jerk-limited smoothing](https://moveit.picknik.ai/main/doc/examples/time_parameterization/time_parameterization_tutorial.html), but the configured driver must faithfully execute the result. A preview in RViz is not a physics simulation or a physical tracking test. MuJoCo adds physics testing where needed; it is no longer the required planner or hardware execution gate.
 
-- the NERO SDK's Cartesian/IK functions for a minimal hardware-oriented prototype;
-- [`mink`](https://github.com/kevinzakka/mink), a MuJoCo-based differential IK library;
-- [`cuRobo`](https://curobo.org/) later, if GPU-accelerated IK and trajectory optimization become useful.
+Retain physical emergency stop, bounded motion, fresh-state checks, fault monitoring, and supervised initial execution. Planned limits and software monitoring do not replace physical safeguards. A stop must not automatically disable motors or reset the controller, since either can change how the arm is supported.
 
-IK success is not the same as motion-planning success. A valid final pose may still require moving through a collision.
+The vendor ROS integration uses pyAgxArm, so changing frameworks does not automatically resolve SDK/firmware issues. Existing findings about feedback freshness and acceleration command units must be checked in the ROS driver path. The project-local acceleration compatibility fix currently applies only to the experimental Python adapter; it is not automatically installed into the vendor ROS stack.
 
-### 5. Trajectory generation
+## Current implementation and reuse
 
-The planner must produce a time-ordered sequence of joint configurations:
+| Existing component | Status and role during migration |
+| --- | --- |
+| `nero_planner` | Custom MuJoCo IK, trajectory validation, and kinematic playback. Retain as an offline reference; MoveIt is the target motion planner. |
+| `nero_experiment` | Experimental OpenRouter action selection and upright/return execution. Reuse structured-output validation and reporting ideas; replace its motion backend for the new application. |
+| `models/nero` and model preparation scripts | Official-URDF-derived MuJoCo assets. Retain for optional simulation and model comparison. |
+| `nero_safety_common.py`, `control_nero.py`, and hardware utilities | Direct SDK/CAN utilities. Retain for isolated diagnostics and recovery, outside concurrent ROS execution. |
+| `nero_experiment/sdk_compat.py` | Project-local acceleration encoding/readback correction for the reviewed SDK and NERO firmware. Preserve the tests and hardware findings during driver integration. |
+| `tests/` and execution reports | Existing offline checks and diagnostic evidence. Extend with ROS integration and measured execution checks during migration. |
 
-```text
-q_start → q_1 → q_2 → ... → q_goal
-```
+The ROS 2 backend, proposed Python tools, feedback-driven LLM loop, and camera-based object skills are not implemented yet. The immediate next milestone is **one verified NERO motion through the vendor ROS 2/MoveIt integration, callable from Python**.
 
-The simplest first version is a joint-space interpolation. Every interpolated point must be checked, not only the start and goal:
+## Existing experimental workflows
 
-```python
-for alpha in np.linspace(0.0, 1.0, num_steps):
-    q = (1.0 - alpha) * q_start + alpha * q_goal
-    check_joint_limits(q)
-    check_collisions(q)
-```
-
-For cluttered scenes, replace straight interpolation with a real planner such as RRT-Connect through [OMPL](https://ompl.kavrakilab.org/), or use trajectory optimization. OMPL supplies planning algorithms but intentionally leaves collision checking and robot modeling to the application; MuJoCo can provide those checks.
-
-The real arm should receive modest, bounded moves. Long open-loop trajectories are inappropriate while the vision model is still learning the camera-to-robot relationship.
-
-### 6. Collision checking
-
-For each candidate configuration:
-
-1. Copy the candidate joint positions into MuJoCo's `qpos`.
-2. Set velocities to zero for a static configuration check.
-3. Run forward kinematics and collision detection.
-4. Inspect active contacts and minimum clearance.
-5. Reject self-collisions, table collisions, forbidden obstacle contacts, and configurations too close to hazards.
-
-Conceptual implementation:
-
-```python
-def is_safe_configuration(model, data, q, minimum_clearance_m=0.03):
-    data.qpos[:7] = q
-    data.qvel[:] = 0.0
-
-    mujoco.mj_forward(model, data)
-
-    for joint_id in range(model.njnt):
-        address = model.jnt_qposadr[joint_id]
-        lower, upper = model.jnt_range[joint_id]
-        if not lower <= data.qpos[address] <= upper:
-            return False
-
-    for contact_index in range(data.ncon):
-        contact = data.contact[contact_index]
-        if contact.dist < minimum_clearance_m:
-            return False
-
-    return True
-```
-
-The production implementation should classify contact pairs by geom name or ID. Not every contact is necessarily forbidden: for example, gripper fingers may intentionally contact a grasped object. The allowed-contact policy must be explicit.
-
-MuJoCo's collision result is only as accurate as the model and collision geometry. Add conservative margins around the table, obstacles, and robot links. Standard MuJoCo collision detection primarily operates on convex geometries, so complex meshes may need decomposition or simplified proxies.
-
-### 7. Validated joint trajectory
-
-The output of the MuJoCo stage should be a typed, validated object rather than a bare list:
-
-```text
-ValidatedTrajectory
-  joint_names
-  positions[N, 7]
-  timestamps[N]
-  source_target_pose
-  minimum_clearance
-  ik_error
-  validation_status
-```
-
-Validation should include:
-
-- joint-position limits;
-- joint-velocity and acceleration limits;
-- collision and clearance checks;
-- end-effector final-pose error;
-- maximum joint displacement;
-- expected execution duration;
-- a valid starting state matching the measured arm state.
-
-The trajectory should be rejected if the real arm has moved materially since the planning state was captured. Re-synchronize and plan again instead.
-
-### 8. pyAgxArm / NERO adapter
-
-The adapter is the only component that should issue real NERO motion commands.
-
-It is responsible for:
-
-- CAN connection and configuration;
-- reading measured joint positions;
-- checking arm status and error codes;
-- checking that all joints are enabled;
-- sending joint or Cartesian commands;
-- limiting speed;
-- monitoring execution;
-- stopping or disabling the arm on failure.
-
-The current repository already contains direct `pyAgxArm` connection and safety helpers in [`nero_safety_common.py`](nero_safety_common.py) and [`control_nero.py`](control_nero.py). These should remain below the planner. The planner must not bypass the adapter to access CAN directly.
-
-The simulator may approve a motion, but the adapter must perform a final real-hardware validation immediately before execution.
-
-### 9. Real robot feedback
-
-After execution, read the achieved joint state and end-effector pose. Do not assume the arm reached the commanded target.
-
-The next vision observation should be based on:
-
-```text
-actual measured state + new camera images
-```
-
-This is important when the arm lags, encounters contact, reaches a limit, or is stopped by a safety condition.
-
-## Suggested execution loop
-
-```python
-while task_is_active:
-    observation = cameras.capture()
-    robot_state = nero.read_state()
-
-    target = astra.choose_target(observation, robot_state)
-    target = planner.normalize_target(target)
-
-    planner.sync_mujoco(robot_state)
-    candidates = planner.solve_ik_and_generate_candidates(target)
-
-    trajectory = planner.select_safe_trajectory(candidates)
-    if trajectory is None:
-        report_failure("No safe trajectory found")
-        break
-
-    nero.execute_if_still_safe(trajectory)
-    execution_result = nero.wait_for_completion()
-
-    if not execution_result.success:
-        report_failure(execution_result.reason)
-        break
-```
-
-The first version should execute one short target motion per vision observation. Continuous visual servoing can be added later as a separate controller.
-
-## Piper and NERO MuJoCo model availability
-
-### AgileX Piper
-
-AgileX Piper already has several MuJoCo models available:
-
-- [Google DeepMind MuJoCo Menagerie: `agilex_piper`](https://github.com/google-deepmind/mujoco_menagerie/tree/main/agilex_piper)
-- [Community `Piper_mujoco` model](https://github.com/soulde/Piper_mujoco)
-- [AgileX Piper MuJoCo + `ros2_control` package](https://github.com/renesas-rdk/agilex_piper_mujoco)
-
-The Menagerie model is the best starting point for a maintained reference model. The community packages are useful examples of controllers and integration, but their geometry, joint conventions, actuator parameters, and licenses should be checked before using them as a hardware-accurate source.
-
-### AgileX NERO
-
-NERO is a different robot: it has seven degrees of freedom, while Piper has six. I did not find an official NERO MuJoCo model in the public MuJoCo Menagerie or an obvious official AgileX NERO MJCF package.
-
-AgileX does provide NERO support through its Python SDK and ROS drivers. The likely NERO simulation path is therefore:
-
-1. Obtain the official NERO URDF and meshes from the AgileX driver/package.
-2. Verify joint names, axes, limits, base frame, flange frame, and gripper frame against the physical robot.
-3. Convert or recreate the model in MJCF.
-4. Start with simplified collision geometries.
-5. Calibrate the model against measured NERO forward-kinematics poses.
-6. Validate every simulated trajectory with conservative real-world margins.
-
-Piper is useful for learning the MuJoCo tooling, but its model cannot be used directly for NERO planning because the kinematic chain and joint count differ.
-
-## Recommended implementation phases
-
-### Phase 1: offline model validation
-
-- Add the NERO MJCF model.
-- Load it in the MuJoCo viewer.
-- Verify the joint order and zero pose.
-- Verify forward-kinematics end-effector positions against the SDK.
-- Add the table and basic collision geometry.
-
-### Phase 2: manual target planning
-
-- Use a hard-coded end-effector target.
-- Solve IK from a measured starting configuration.
-- Generate a short joint-space trajectory.
-- Validate joint limits and collision clearance.
-- Visualize the trajectory without hardware.
-
-### Phase 3: hardware dry run
-
-- Read the real NERO state.
-- Synchronize MuJoCo to that state.
-- Plan a small motion.
-- Require an explicit human confirmation.
-- Execute at low speed.
-- Compare measured and simulated motion.
-
-### Phase 4: closed-loop vision
-
-- Add camera calibration and frame transforms.
-- Have Astra return structured target poses.
-- Re-plan after every short movement.
-- Add grasp/lift/place waypoints.
-- Add object and obstacle updates.
-
-### Phase 5: advanced planning
-
-- Add OMPL, trajectory optimization, or cuRobo if straight-line interpolation is insufficient.
-- Add force/contact checks.
-- Add synthetic camera testing.
-- Add randomized simulation tests for model and perception error.
-
-## Safety boundary
-
-MuJoCo is a planning and validation tool, not a substitute for physical safety systems.
-
-The real system must retain:
-
-- physical emergency stop;
-- conservative speed limits;
-- workspace and table-clearance checks;
-- arm-status and error monitoring;
-- joint-enable checks;
-- execution timeout;
-- immediate stop/disable behavior;
-- human supervision during initial tests.
-
-The simulator should make dangerous motions less likely. It cannot guarantee that the physical arm will never collide, especially when the model, calibration, payload, tool, or environment is inaccurate.
-
-## Current repository status
-
-The repository contains direct Python/CAN control and safety scripts, an official-URDF-derived NERO MuJoCo scene, and a simulation-only pose executor in `nero_planner`. The executor provides numerical IK, timed joint interpolation, conservative full-path collision/clearance validation, and kinematic playback. `nero_experiment` adds an experimental OpenRouter/Gemini upright-and-return workflow with read-only hardware capture and opt-in, monitored physical execution. Camera/Astra integration and calibrated dynamic trajectory tracking are not implemented.
-
-The implemented milestone is a simulation-only target executor:
-
-```text
-hard-coded Pose
-→ MuJoCo IK
-→ trajectory generation
-→ collision/joint-limit validation
-→ visualization
-```
-
-The simulation executor does not import `pyAgxArm` or connect to CAN. Its validation is relative to the proxy model and documented contact exclusions; it is not hardware clearance certification.
+The sections below document the current implementation for reproducibility and diagnostics. They are not setup instructions for the target ROS 2 architecture. Their `--execute` commands still use direct SDK/CAN control, not MoveIt. No ROS launch files or migration commands have been added to this project yet.
 
 ## Preparing the MuJoCo environment
 
@@ -491,9 +247,9 @@ python -m unittest discover -s tests -v
 
 This builds an isolated scene from the prepared URDF and tests successful reaching, mesh enclosure, tool/gripper conventions, table/apple/self-collision rejection, near misses without forbidden contacts, unsafe path interiors with safe endpoints, validation-budget exhaustion, pose/step/timing limits, malformed inputs, stale states/scenes, and modified trajectory rejection. It requires neither CAN nor a display. The root-level `test_nero.py`, `test_backend.py`, and related scripts are existing hardware utilities and are not part of this offline suite.
 
-Remaining milestones are physical validation of the experimental adapter, hardware FK/TCP calibration, refined assembly collision models, dynamic tracking validation, camera calibration, and Astra target selection.
+These tests cover the existing MuJoCo implementation only. They do not validate the planned ROS 2 backend or physical trajectory tracking; new development follows the migration milestones above.
 
-## First OpenRouter experiment: upright and return
+## Existing OpenRouter experiment: upright and return
 
 `nero_experiment` implements this sequence:
 
