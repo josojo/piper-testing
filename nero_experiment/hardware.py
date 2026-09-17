@@ -179,6 +179,20 @@ class NeroHardware:
             motor_timestamps.append(timestamps[-1])
             velocities.append(motor.velocity)
         velocities = vector(velocities, 7, "measured velocities")
+        # Motor velocity is used by the live stream guard, so it must be
+        # temporally aligned as tightly as joint positions. The old general
+        # feedback check allowed these packets to be up to 250 ms old.
+        now = self.wall_clock()
+        motor_ages = [now - stamp for stamp in motor_timestamps]
+        motor_skew = max(motor_timestamps) - min(motor_timestamps)
+        if motor_skew > MAX_JOINT_SNAPSHOT_SKEW_S or max(motor_ages) > MAX_JOINT_SNAPSHOT_AGE_S:
+            detail = ", ".join(f"joint{index}={age * 1000:.1f} ms"
+                               for index, age in enumerate(motor_ages, 1))
+            raise JointFeedbackTimingError(
+                f"Motor velocity feedback timing rejected: skew={motor_skew * 1000:.1f} ms "
+                f"(limit {MAX_JOINT_SNAPSHOT_SKEW_S * 1000:.0f} ms); ages [{detail}] "
+                f"(limit {MAX_JOINT_SNAPSHOT_AGE_S * 1000:.0f} ms); "
+                f"timestamps={[round(stamp, 6) for stamp in motor_timestamps]}")
         if require_enabled and (state_code != 0 or not all(enabled)):
             raise PlanningError("All joints must already be enabled and NORMAL; this experiment never auto-enables")
         # Require all three constituent flange packets as well.

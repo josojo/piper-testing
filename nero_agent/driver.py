@@ -9,7 +9,7 @@ import json
 import math
 import time
 
-from .core import AgentError, JOINTS
+from .core import AgentError, JOINTS, MAX_EXCURSION_RAD, LARGE_EXCURSION_RAD, SEGMENT_EXCURSION_RAD
 from .stream_guard import StreamGuard
 from .controlled_abort import ControlledAbort
 
@@ -20,10 +20,17 @@ def main():
     parser.add_argument('--diagnose-feedback', action='store_true')
     parser.add_argument('--diagnostic-duration', type=float, default=30.)
     parser.add_argument('--abort-qualification-report', type=str)
+    parser.add_argument('--motor-velocity-limit', type=float, default=0.10,
+                        help='Temporary motor-feedback trip limit in rad/s (0.10-0.15)')
     parser.add_argument('--namespace', default='/nero')
+    profile = parser.add_mutually_exclusive_group()
+    profile.add_argument('--large-motion', action='store_true')
+    profile.add_argument('--segmented-motion', action='store_true')
     args = parser.parse_args()
     if not math.isfinite(args.diagnostic_duration) or not 1 <= args.diagnostic_duration <= 120:
         parser.error('diagnostic duration must be between 1 and 120 seconds')
+    if not math.isfinite(args.motor_velocity_limit) or not 0.10 <= args.motor_velocity_limit <= 0.15:
+        parser.error('motor velocity limit must be between 0.10 and 0.15 rad/s')
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import JointState
@@ -48,6 +55,7 @@ def main():
             self.received = 0.0
             self.fault = None
             self.feedback_error = None
+            self.velocity_trip_history = None
             self.cancel_client = self.create_client(CancelGoal, 'arm_controller/follow_joint_trajectory/_action/cancel_goal')
             self.abort = ControlledAbort(hardware, self.block_stream, self.cancel_controller)
             self.fault_pub = self.create_publisher(String, 'project/fault', 10)
@@ -119,7 +127,11 @@ def main():
                     self.diagnostic_trial.observe(state, now)
                 trial_reason = self.trial.observe(state, now) if self.trial else None
                 if self.guard:
-                    self.guard.check_feedback(state.joints_rad, state.velocities_rad_s, width, now)
+                    self.guard.check_feedback(
+                        state.joints_rad, state.velocities_rad_s, width, now,
+                        velocity_timestamps=state.motor_velocity_timestamps,
+                        wall_now=time.time(),
+                        position_timestamps=state.joint_position_timestamps)
                 if trial_reason:
                     if self.trial.outcome == 'failed':
                         self.fault = trial_reason
@@ -146,6 +158,8 @@ def main():
                     self.fault = detail
                 if self.guard:
                     self.fault = str(error)
+                    if hasattr(error, 'history'):
+                        self.velocity_trip_history = error.history
                     try:
                         self.stop()
                     except Exception as stop_error:
@@ -181,6 +195,8 @@ def main():
 
         def abort_result(self, full=False):
             result = self.abort.result()
+            if full and self.velocity_trip_history is not None:
+                result['velocity_trip_history'] = self.velocity_trip_history
             trial = self.trial or self.diagnostic_trial
             if trial:
                 result['commissioning'] = (trial.result(result, self.fault) if full else trial.live_status())
@@ -189,12 +205,13 @@ def main():
         def abort_report(self, request, response):
             diagnostic_done = (args.diagnose_feedback and self.diagnostic_end is not None
                                and time.monotonic() >= self.diagnostic_end)
-            response.success = self.abort.phase in ('holding', 'failed') or diagnostic_done
+            response.success = self.abort.phase in ('holding', 'rechecking', 'failed') or diagnostic_done
             response.message = 'Full trace unavailable until observation ends'
             if response.success:
                 # Reuse the serialized snapshot for repeated report requests.
-                if self.report_cache is None or self.report_cache[0] != self.abort.phase:
-                    self.report_cache = (self.abort.phase, json.dumps(self.abort_result(full=True)))
+                cache_key = (self.abort.phase, self.abort.samples, self.abort.recheck_count)
+                if self.report_cache is None or self.report_cache[0] != cache_key:
+                    self.report_cache = (cache_key, json.dumps(self.abort_result(full=True)))
                 response.message = self.report_cache[1]
             return response
 
@@ -217,7 +234,7 @@ def main():
                 self.abort.POSITION_TOLERANCE = .002
                 self.abort.MAX_EXCURSION = .01
                 self.last_state, self.last_width, self.received = state, width, now
-                self.guard = StreamGuard(state.joints_rad, width, now)
+                self.guard = StreamGuard(state.joints_rad, width, now, args.motor_velocity_limit)
                 self.tick()
                 if self.fault:
                     raise AgentError(self.fault)
@@ -282,7 +299,10 @@ def main():
                     state = self.hardware.stationary(require_enabled=True)
                     width, _ = self.gripper()
                     self.last_state, self.last_width, self.received = state, width, time.monotonic()
-                    self.guard = StreamGuard(state.joints_rad, width, self.received)
+                    self.guard = StreamGuard(state.joints_rad, width, self.received,
+                                             args.motor_velocity_limit,
+                                             SEGMENT_EXCURSION_RAD if args.segmented_motion else
+                                             LARGE_EXCURSION_RAD if args.large_motion else MAX_EXCURSION_RAD)
                     # Setup uses blocking SDK reads. Refresh publication before
                     # acknowledging the gate so clients do not inherit old state.
                     self.tick()
@@ -337,7 +357,7 @@ def main():
                     node.stop()
                 # On shutdown callbacks may no longer spin. Cancellation times
                 # out boundedly; fresh SDK feedback still drives the hold check.
-                deadline = time.monotonic() + 6.0
+                deadline = time.monotonic() + 12.0
                 while node.abort.phase not in ('idle', 'holding', 'failed') and time.monotonic() < deadline:
                     node.abort.tick()
                     time.sleep(0.01)

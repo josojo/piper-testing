@@ -8,6 +8,54 @@ import urllib.request
 from .core import AgentError, strict_json
 
 
+def decode_action_response(body):
+    """Decode Chat Completions structured output without assuming one wire shape."""
+    try:
+        response = strict_json(body)
+        choice = response['choices'][0]
+        message = choice['message']
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise AgentError('Malformed LLM action response: missing choices/message') from None
+    if choice.get('finish_reason') != 'stop':
+        raise AgentError('LLM refused or returned an incomplete action (finish_reason=%s)' %
+                         choice.get('finish_reason', 'missing'))
+    if message.get('refusal'):
+        raise AgentError('LLM refused to return an action')
+
+    # Providers normally return a JSON string. Some return the parsed object
+    # directly, and some wrap text in the standard content-block array.
+    content = message.get('content')
+    if content is None and 'parsed' in message:
+        content = message['parsed']
+    if isinstance(content, list):
+        text_blocks = []
+        for block in content:
+            if not isinstance(block, dict) or block.get('type') not in (None, 'text'):
+                raise AgentError('Malformed LLM action response: unsupported content block')
+            value = block.get('text')
+            if not isinstance(value, str):
+                raise AgentError('Malformed LLM action response: content block has no text')
+            text_blocks.append(value)
+        content = ''.join(text_blocks)
+    if isinstance(content, dict):
+        action = content
+    elif isinstance(content, str):
+        text = content.strip()
+        if text.startswith('```') and text.endswith('```'):
+            text = text[3:-3].strip()
+            if text.startswith('json'):
+                text = text[4:].lstrip()
+        try:
+            action = strict_json(text)
+        except (TypeError, ValueError):
+            raise AgentError('Malformed LLM action response: content is not a JSON object') from None
+    else:
+        raise AgentError('Malformed LLM action response: unsupported content type')
+    if not isinstance(action, dict):
+        raise AgentError('Malformed LLM action response: action is not an object')
+    return action
+
+
 class OpenRouterChooser:
     def __init__(self, model=None, transport=urllib.request.urlopen):
         try:
@@ -52,10 +100,4 @@ class OpenRouterChooser:
             raise AgentError('OpenRouter request failed or timed out') from None
         if len(body) > 1_000_000:
             raise AgentError('OpenRouter response too large')
-        try:
-            choice = strict_json(body)['choices'][0]
-            if choice.get('finish_reason') != 'stop' or choice['message'].get('refusal'):
-                raise AgentError('LLM refused or returned an incomplete action')
-            return strict_json(choice['message']['content'])
-        except (KeyError, IndexError, TypeError, ValueError):
-            raise AgentError('Malformed LLM action response') from None
+        return decode_action_response(body)

@@ -14,6 +14,7 @@ class ControlledAbort:
     POSITION_TOLERANCE = 0.005
     MAX_EXCURSION = 0.02
     STOPPED_SPEED = 0.01
+    RECHECK_TIMEOUT = 5.0
 
     def __init__(self, hardware, block_stream, cancel_controller, clock=time.monotonic):
         self.hardware, self.block_stream = hardware, block_stream
@@ -29,6 +30,8 @@ class ControlledAbort:
         self.samples = 0
         self.last_state = None
         self.last_source_stamp = None
+        self.recheck_count = 0
+        self.recheck_deadline = None
 
     def start(self, reason):
         if self.phase != 'idle':
@@ -56,6 +59,8 @@ class ControlledAbort:
             return
         try:
             now = self.clock()
+            if self.phase == 'rechecking' and now >= self.recheck_deadline:
+                raise AgentError('Powered hold recheck did not settle within 5 seconds')
             if self.phase == 'cancelling':
                 if self.future is not None and not self.future.done() and now < self.deadline:
                     return
@@ -87,13 +92,20 @@ class ControlledAbort:
             stationary = (distance(q, self.target) <= self.POSITION_TOLERANCE and
                           max(map(abs, v)) <= self.STOPPED_SPEED)
             if self.phase == 'holding' and not stationary:
-                raise AgentError('Powered hold lost after standstill verification')
+                self.phase = 'rechecking'
+                self.recheck_count += 1
+                self.recheck_deadline = now + self.RECHECK_TIMEOUT
+                self.deadline = self.recheck_deadline
+                self.timings['last_recheck_started_monotonic_s'] = now
+                self.stable_since = None
             if stationary:
                 if self.first_stable_since is None:
                     self.first_stable_since = now
                 if self.stable_since is None:
                     self.stable_since = now
                 if now - self.stable_since >= self.HOLD_DWELL:
+                    if self.phase == 'rechecking':
+                        self.timings['last_recheck_confirmed_monotonic_s'] = now
                     self.phase = 'holding'
             else:
                 self.last_nonstationary = now
@@ -131,6 +143,9 @@ class ControlledAbort:
                 'hold_target_rad': self.target, 'observed_state': self.last_state,
                 'feedback_samples': self.samples,
                 'hold_dwell_s': self.HOLD_DWELL,
+                'recheck_count': self.recheck_count,
+                'recheck_timeout_s': self.RECHECK_TIMEOUT,
+                'recheck_deadline_monotonic_s': self.recheck_deadline,
                 'stable_since_monotonic_s': self.stable_since,
                 'first_stable_since_monotonic_s': self.first_stable_since,
                 'last_nonstationary_monotonic_s': self.last_nonstationary,

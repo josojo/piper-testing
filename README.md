@@ -86,6 +86,75 @@ This starts the normal stack in a dedicated diagnostic mode. Collection starts a
 
 Compare `read_errors`, packet ages, `timer_interval_s`, and `read_duration_s` with the standalone report. Full-stack callback duration also includes gripper reads, publication and bridge error logging; `bridge_errors` records failures outside the arm reader as well. During collection this diagnostic also builds a bounded, diagnostic-only trace and polls the actual abort-status service at most 10 times per second. Live replies contain no trace or trace-based calculations. The summary includes request count and maximum response size; `reporting_test.full_trace` contains the report fetched once after collection. This tests the reporting workload without issuing an abort or position command. Full abort reports are unavailable during active observation; normal commissioning also uses compact polling and a final trace fetch. Interrupted full-stack tests record interruption without exporting partial samples. Completion means collection finished, not a safety qualification. No Docker rebuild is needed.
 
+### Camera-down photo goals and current tool pose
+
+Cartesian ROS named poses optionally accept `"orientation_mode": "camera_down_free_yaw"`.
+Omitting it (or using `"fixed"`) preserves the existing orientation tolerances.
+The free-yaw mode requires a reference quaternion whose tool +Z points along
+base_link -Z, for example `[1, 0, 0, 0]`. It keeps the existing 0.08-rad
+per-axis tilt tolerances while allowing the full ±pi range of spin. This uses
+MoveIt's XYZ Euler orientation-error parameterization. It assumes the camera
+looks along tcp_link +Z; verify your physical mounting. It constrains the
+**destination**, not camera orientation throughout the route, and does not
+guarantee the closest joint solution. Collision, tracking, speed, joint and
+segmented-preflight checks are unchanged. Only `table_photo_center` in the
+local hardware configuration opts into this mode; its coordinates are preserved.
+
+With other controllers stopped, capture the current modeled tool pose without
+planning or executing a motion:
+
+```bash
+sudo bash scripts/capture_nero_pose.sh
+# Optional: CONFIG and OUTPUT arguments
+sudo bash scripts/capture_nero_pose.sh nero-agent.local.json reports/current-tcp-pose.json
+```
+
+This starts and cleans up the usual capture ROS stack, reads measured joint
+feedback, and requests forward kinematics for `tcp_link` in `base_link`. It prints
+`tcp_pose` and saves that pose, its sample timestamp, and the measured joints.
+It does not open an execution gate. Coordinates are meters and quaternion order
+is x/y/z/w. This is the kinematic-model estimate from a feedback snapshot, not
+an exact external measurement or the camera optical-center pose. Hold the robot
+stationary for a useful capture. The output file is replaced on each invocation.
+
+### Raw CAN timing trace alongside the SDK
+
+Add `--raw-can-output reports/feedback-can-01.jsonl` to a `hardware` or
+`diagnose-feedback-stack` invocation. Use a new filename each time; existing
+files are never overwritten. No Docker rebuild is needed. For a stationary baseline:
+
+```bash
+sudo ./scripts/nero_ros2.sh diagnose-feedback-stack nero-agent.local.json \
+  --duration 30 --output reports/agent-feedback-stack.json \
+  --raw-can-output reports/feedback-can-01.jsonl
+```
+
+The receive-only recorder starts before the hardware bridge and stops after its
+shutdown/hold observation. It runs in a separate process, with no CAN sends or
+logging calls in the driver's stop path. Capture startup failure prevents stack
+startup; a later recorder failure does not change motion handling or safety limits.
+This option does not itself authorize or start movement. Ordinary `--execute`
+confirmation and all safety checks still apply.
+
+JSONL rows preserve CAN IDs (including flags), payload bytes, kernel receive
+timestamps (`kernel_unix_ns`), and userspace wall/monotonic timestamps. Compare
+kernel timestamps divided by 1e9 with the SDK's `joint_position_timestamps` and
+`motor_velocity_timestamps` in the diagnostic or `velocity_trip_history` in the
+abort report. This captures intermediate packets that cache polling can miss.
+Motor feedback IDs 0x251–0x257 encode signed big-endian velocity in bytes 0–1,
+scaled by 0.001 rad/s for the audited SDK/firmware (see
+[velocity verification](docs/nero-velocity-verification.md)). Raw bytes remain
+authoritative if firmware differs.
+
+Capture is bounded to 30 minutes or approximately 256 MiB, then ends with a
+`capture_limit` footer and warning; it does not abort an ongoing robot operation.
+Keep the matching robot report and CAN trace together. Check the footer and
+`socket_drops_total` before interpreting results: nonzero counters indicate this
+socket lost frames, absent counters do not prove end-to-end completeness, and a
+missing footer indicates an incomplete trace. Kernel receive time is not motor
+acquisition time; clock changes, upstream losses, scheduling, and recorder load
+still limit conclusions. This is diagnostic evidence, not a safety qualification.
+
 ### Supported abort test during motion
 
 Analyze an existing report without ROS or hardware access:
@@ -134,9 +203,72 @@ sudo ./scripts/nero_ros2.sh hardware nero-agent.local.json --scripted --execute 
 
 Each physical motion requires typing `EXECUTE`. Start with the deterministic test before using LLM choices. A failure ends the sequence without an automatic return or retry. Initial hardware testing must establish tracking and stop behavior; this bridge has not yet been physically validated.
 
-Plans use 0.08 rad/s velocity and 0.15 rad/s² acceleration caps, with a 0.15 rad maximum excursion from the captured start. MoveIt sends the timed trajectory to the ROS2 `joint_trajectory_controller`; the hardware bridge forwards controller position targets through the vendor's ordinary `move_j` position interface. The unsmoothed instantaneous SDK `move_js` interface is not used for trajectory execution. The bridge retains the 0.10 rad/s measured-velocity guard, fresh-feedback checks, tracking bounds, and a command/heartbeat watchdog. It reuses the pinned SDK and firmware-specific acceleration encoding/readback correction. These checks can reject a trajectory; they do not establish physical tracking performance in advance.
+MoveIt planning currently targets 0.02 rad/s velocity and 0.03 rad/s² acceleration through scaling of the model's 0.08 rad/s and 0.15 rad/s² caps. Plans and streamed commands allow a 0.30 rad (about 17°) maximum per-joint excursion from their captured start; measured feedback has an additional 0.01 rad margin. Trajectory excursion rejections report the joint with the largest displacement, its start and planned position, excess over the limit, and trajectory time. Accepted plan summaries include peak excursion. The execution timeout remains 30 seconds; commissioning retains its tighter limits. This allowance does not guarantee that a Cartesian photo target is reachable within the envelope.
+
+MoveIt sends the timed trajectory to the ROS2 `joint_trajectory_controller`; the hardware bridge forwards controller position targets through the vendor's ordinary `move_j` position interface. The unsmoothed instantaneous SDK `move_js` interface is not used for trajectory execution. The bridge retains the default 0.10 rad/s motor-feedback guard (optionally raised with `--motor-velocity-limit` up to 0.15 rad/s), using the median of the last three fresh absolute-speed samples within 30 ms (two over-limit samples trip, including at startup; repeated cached packets do not count). A raw sample above twice the configured motor limit still trips immediately. This filter typically adds one 10 ms polling interval to sustained-overspeed detection and is not hardware-qualified. The bridge also retains an independent 0.15 rad/s position-derived velocity check, fresh-feedback checks, tracking bounds, and a command/heartbeat watchdog. It reuses the pinned SDK and firmware-specific acceleration encoding/readback correction. These checks can reject a trajectory; they do not establish physical tracking performance in advance.
 
 After a moving-abort qualification passes, supply that report explicitly for hardware execution:
+
+The optional configuration field `"motion_profile": "mujoco_large"` raises normal
+planning and driver excursion limits to 1.20 rad per joint (measured feedback:
+1.21 rad) and the application execution timeout to 90 seconds. The default
+`bounded` profile remains 0.30 rad / 30 seconds. Commissioning keeps its original
+tighter limits. Speed, acceleration, watchdog and controlled-abort checks do not
+increase.
+
+The local hardware configuration now selects `"motion_profile": "mujoco_segmented"`.
+This uses a separate overall allowance of 3.14 rad per joint from the original
+captured start, the loaded model's absolute joint limits, and a 600-second route
+budget. It does not reset the overall reference at each step. After checking the
+original route, it selects route waypoints no more than 0.09 rad apart and joins
+them with rest-to-rest quintic legs (0.02 rad/s and 0.03 rad/s²). Because these
+connections change the path, every resulting leg is also fully checked in MuJoCo
+before the route is offered for execution. Up to 128 legs are allowed.
+
+The driver enforces a separate 0.10-rad command envelope per leg (0.11 rad for
+measured feedback); each leg has a 15-second duration cap. Action success must
+be followed by measured arrival within 0.005 rad and speed no greater than
+0.003 rad/s for 0.5 seconds. The gate then closes before validating the next leg.
+Its first point is aligned to fresh measured feedback and retimed/rechecked
+while disarmed. Drift greater than 0.0005 rad during setup, scene changes,
+gripper changes, or failed settling stop the sequence; no automatic retry or
+return is attempted. Completed legs are saved as `segment_completed` report
+events. Unknown scene objects, attached objects and octomaps block this profile
+because they are not represented by the configured MuJoCo obstacle boxes.
+Obstacle comparison composes the message frame, object pose and primitive pose
+into `base_link` using fixed transforms from the loaded URDF. Unknown or moving
+frames are rejected; `world` is not assumed identical to `base_link`. MuJoCo
+places the configured obstacle boxes using that same fixed base transform.
+
+Every plan in either MuJoCo profile must pass `nero_agent/mujoco_preflight.py` before it
+can be offered for execution. It imports MoveIt's loaded URDF collision meshes
+into MuJoCo, uses the measured gripper width and the configuration's collision
+boxes, and reuses the existing named structural-body exclusions. Meshes receive
+enclosing boxes with 3 mm padding. Adaptive Bezier bounds cover the controller's
+quintic interpolation, require 3 mm clearance, and include a 0.015 rad joint
+tracking envelope. Joint limits, excursion, velocity and acceleration are also
+checked between waypoints. Missing assets, unsupported geometry or exhausted
+validation budgets reject the plan. The result appears under
+`events[].plan.mujoco_preflight` in the JSON report.
+
+This is an additional geometric check, not calibrated motor/load simulation or
+physical safety certification. Conservative boxes can reject otherwise usable
+paths. It cannot see unmodeled objects or validate cable routing. Execution uses
+the checked trajectory; if hardware setup changes the state, this profile
+rejects and asks for a new plan instead of silently replanning while armed.
+Start with a planning-only invocation (omit `--execute`). No Docker rebuild is
+needed with the existing image's MuJoCo dependency.
+
+After a controlled abort has reached verified `holding`, a speed/position
+disturbance within the hard hold-excursion bound changes the status to
+`rechecking`. The existing hold target is retained and execution stays latched
+off; no additional motion command is sent. A fresh uninterrupted hold dwell
+(normally one second) must complete within five seconds of the disturbance.
+Further spikes reset the dwell but never extend that recovery deadline.
+Stale/disabled feedback and excess hold excursion still fail immediately.
+The client bounds its total stop-observation wait to 12 seconds. Reports expose
+the recheck count, deadline and most recent start/confirmation times. Recovering
+the hold does not resume the interrupted route.
 
 ```bash
 sudo ./scripts/nero_ros2.sh hardware nero-agent.local.json --scripted --execute \

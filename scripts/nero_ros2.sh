@@ -31,7 +31,7 @@ case "$operation" in
         --config examples/nero-agent.mock.json --execute "$@"
     fi
     if [[ $# -lt 1 ]]; then
-      echo "Usage: $0 $operation path/to/reviewed-config.json [--scripted] [--execute] [--output reports/result.json]" >&2
+      echo "Usage: $0 $operation path/to/reviewed-config.json [--start-pose NAME | --scripted] [--execute] [--output reports/result.json]" >&2
       exit 2
     fi
     config_path=$1
@@ -64,6 +64,6 @@ case "$operation" in
     exec docker run "${runtime[@]}" "$image_name" python3 -m nero_agent.bringup --config "$config_path" "$@"
     ;;
   *)
-    echo "Usage: $0 build | demo [--scripted | --instruction TEXT] | capture CONFIG | validate-hold CONFIG | commission-abort CONFIG | diagnose-feedback CONFIG [--duration 30] | diagnose-feedback-stack CONFIG [--duration 30] | hardware CONFIG [--scripted] [--execute]"
+    echo "Usage: $0 build | demo [--scripted | --instruction TEXT] | capture CONFIG | validate-hold CONFIG | commission-abort CONFIG | diagnose-feedback CONFIG [--duration 30] | diagnose-feedback-stack CONFIG [--duration 30] | hardware CONFIG [--start-pose NAME | --scripted] [--execute]"
     ;;
 esac

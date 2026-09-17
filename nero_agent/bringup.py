@@ -21,7 +21,8 @@ def stop_processes(processes):
         for process in reversed(processes):
             if process.poll() is not None:
                 continue
-            for sig, timeout in ((signal.SIGINT, 8), (signal.SIGTERM, 3), (signal.SIGKILL, 3)):
+            # Leave time for the driver's bounded 12-second hold observation.
+            for sig, timeout in ((signal.SIGINT, 14), (signal.SIGTERM, 3), (signal.SIGKILL, 3)):
                 try:
                     os.killpg(process.pid, sig)
                 except ProcessLookupError:
@@ -38,6 +39,8 @@ def stop_processes(processes):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--raw-can-output', type=Path,
+                        help='Optional receive-only CAN JSONL trace; requires a new file')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--diagnose-feedback', action='store_true')
     mode.add_argument('--commission-abort', action='store_true')
@@ -45,6 +48,20 @@ def main():
     mode.add_argument('--validate-hold', action='store_true')
     args, remaining = parser.parse_known_args()
     settings = Settings.parse(strict_json(args.config.read_text()), require_review=args.commission_abort or '--execute' in remaining)
+    if args.raw_can_output and settings.mode != 'hardware':
+        parser.error('--raw-can-output requires hardware mode')
+    if args.raw_can_output:
+        if args.raw_can_output.suffix != '.jsonl':
+            parser.error('--raw-can-output must use a new .jsonl file')
+        protected = [args.config]
+        for option in ('--output', '--abort-qualification-report'):
+            for index, value in enumerate(remaining):
+                if value == option and index+1 < len(remaining):
+                    protected.append(Path(remaining[index+1]))
+                elif value.startswith(option+'='):
+                    protected.append(Path(value.split('=', 1)[1]))
+        if args.raw_can_output.resolve() in [path.resolve() for path in protected]:
+            parser.error('Raw CAN output must be separate from configuration and reports')
     if settings.mode == 'hardware' and '--execute' in remaining:
         from .abort_policy import require_verified_controlled_abort
         try:
@@ -73,9 +90,13 @@ def main():
     processes = []
     logs = []
     initial_file = None
+    raw_capture = None
     directory = ROOT / 'reports'
     directory.mkdir(exist_ok=True)
     try:
+        if args.raw_can_output:
+            from .raw_can import start_capture
+            raw_capture = start_capture(args.raw_can_output)
         commands = [
             [sys.executable, '-m', 'nero_agent.driver' if settings.mode == 'hardware' else 'nero_agent.mock_info',
              '--namespace', settings.namespace],
@@ -84,10 +105,17 @@ def main():
         ]
         if args.diagnose_feedback:
             commands[0].extend(['--diagnose-feedback', '--diagnostic-duration', str(diagnostic_args.duration)])
+        if settings.mode == 'hardware' and settings.mujoco_preflight and not args.commission_abort:
+            commands[0].append('--segmented-motion' if settings.segmented_execution else '--large-motion')
         if args.commission_abort:
             if settings.mode != 'hardware':
                 raise RuntimeError('Commissioning requires hardware configuration')
             commands[0].append('--commission-abort')
+        if '--motor-velocity-limit' in remaining:
+            index = remaining.index('--motor-velocity-limit')
+            if index + 1 >= len(remaining):
+                raise RuntimeError('--motor-velocity-limit requires a value')
+            commands[0].extend(['--motor-velocity-limit', remaining[index + 1]])
         if settings.mode == 'hardware' and '--execute' in remaining and '--abort-qualification-report' in remaining:
             index = remaining.index('--abort-qualification-report')
             if index + 1 < len(remaining):
@@ -157,6 +185,10 @@ def main():
     finally:
         # Stop the controller processes before taking down the hardware bridge.
         stop_processes(processes)
+        # Keep recording through the driver's bounded stop observation.
+        if raw_capture is not None:
+            from .raw_can import stop_capture
+            stop_capture(raw_capture)
         for log in logs:
             log.close()
         if initial_file is not None:

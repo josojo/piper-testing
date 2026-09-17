@@ -106,7 +106,40 @@ class AbortTests(unittest.TestCase):
         self.now = 2.1; a.tick()
         self.assertEqual(a.phase, 'holding')
         self.v[0] = .02; self.now = 2.2; a.tick()
+        self.assertEqual(a.phase, 'rechecking')
+        self.v[0] = 0.; self.now = 2.3; a.tick()
+        self.now = 3.4; a.tick()
+        self.assertEqual(a.phase, 'holding')
+        self.hardware.robot.move_j.assert_called_once()
+        self.assertEqual(a.result()['recheck_count'], 1)
+
+    def test_repeated_spikes_do_not_extend_recheck_deadline(self):
+        a = self.setup_abort(); a.tick()
+        self.now = .1; a.tick(); self.now = 1.2; a.tick()
+        self.v[5] = -.035; self.now = 1.3; a.tick()
+        deadline = a.recheck_deadline
+        for t, speed in ((1.4, 0.), (2., -.035), (2.1, 0.), (2.8, -.035), (6.2, 0.)):
+            self.now, self.v[5] = t, speed
+            a.tick()
+            self.assertEqual(a.phase, 'rechecking')
+            self.assertEqual(a.recheck_deadline, deadline)
+        self.now = 6.31; a.tick()
         self.assertEqual(a.phase, 'failed')
+        self.assertIn('recheck did not settle', a.result()['failure'])
+        a.start('retry')
+        self.hardware.robot.move_j.assert_called_once()
+        self.assertEqual(self.events.count('block'), 1)
+
+    def test_recheck_preserves_excursion_and_feedback_failures(self):
+        for failure in ('excursion', 'feedback'):
+            a = self.setup_abort(); a.tick()
+            self.now = .1; a.tick(); self.now = 1.2; a.tick()
+            self.v[5] = -.035; self.now = 1.3; a.tick()
+            if failure == 'excursion': self.q[0] = .021
+            else: self.hardware.read.side_effect = RuntimeError('stale or disabled')
+            self.now = 1.4; a.tick()
+            self.assertEqual(a.phase, 'failed')
+            self.hardware.robot.move_j.assert_called_once()
 
     def test_feedback_loss_while_holding_is_reported(self):
         a = self.setup_abort(); a.tick()
@@ -163,7 +196,7 @@ class DriverAbortTests(unittest.TestCase):
                    'std_msgs.msg': NS(Empty=NS, String=NS),
                    'std_srvs.srv': NS(SetBool=NS, Trigger=NS),
                    'action_msgs.srv': NS(CancelGoal=NS(Request=NS)),
-                   'nero_experiment.hardware': NS(connect=connect)}
+                   'nero_experiment.hardware': NS(connect=connect, MAX_JOINT_SNAPSHOT_AGE_S=.055)}
         with patch.dict('sys.modules', modules), patch('sys.argv', ['driver']):
             driver.main()
 
@@ -222,7 +255,7 @@ class DriverAbortTests(unittest.TestCase):
                    'std_msgs.msg': NS(Empty=NS, String=NS),
                    'std_srvs.srv': NS(SetBool=NS, Trigger=NS),
                    'action_msgs.srv': NS(CancelGoal=NS(Request=NS)),
-                   'nero_experiment.hardware': NS(connect=connect)}
+                   'nero_experiment.hardware': NS(connect=connect, MAX_JOINT_SNAPSHOT_AGE_S=.055)}
         with patch.dict('sys.modules', modules), patch('sys.argv', ['driver', '--diagnose-feedback']):
             driver.main()
 
@@ -265,7 +298,7 @@ class AbortReportingTests(unittest.TestCase):
         self.assertEqual(trial.live_status()['feedback_samples'], 1000)
         self.assertNotIn('history', trial.live_status())
 
-    def test_status_poll_rate_and_single_full_fetch(self):
+    def test_status_poll_rate_and_fresh_hold_report(self):
         from unittest.mock import patch
         from nero_agent.ros_backend import RosBackend
         backend = RosBackend.__new__(RosBackend)
@@ -284,4 +317,4 @@ class AbortReportingTests(unittest.TestCase):
             backend.fetch_abort_report({'status': 'holding'})
             backend.fetch_abort_report({'status': 'holding'})
         self.assertGreaterEqual(calls[1][1]-calls[0][1], .1)
-        self.assertEqual([client for client, stamp in calls], ['status', 'status', 'report'])
+        self.assertEqual([client for client, stamp in calls], ['status', 'status', 'report', 'report'])

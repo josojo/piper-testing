@@ -11,13 +11,13 @@ import time
 import unittest
 from unittest.mock import patch, MagicMock
 
-from nero_agent.core import (AgentError, JOINTS, OfflineBackend, ScriptedChooser,
+from nero_agent.core import (AgentError, DirectPoseChooser, JOINTS, OfflineBackend, ScriptedChooser,
                              Settings, run_loop, strict_json, validate_action)
 from nero_agent.__main__ import main
 from nero_agent.trajectory import validate_trajectory, validate_model_bounds
 from nero_agent.stream_guard import StreamGuard
 from nero_agent.ros_backend import RosBackend
-from nero_agent.chooser import OpenRouterChooser
+from nero_agent.chooser import OpenRouterChooser, decode_action_response
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,6 +27,21 @@ def config():
 
 
 class AgentTests(unittest.TestCase):
+    def test_direct_pose_chooser_bypasses_llm_after_one_move(self):
+        chooser = DirectPoseChooser('table_photo_center')
+        self.assertEqual(chooser.choose({})['pose'], 'table_photo_center')
+        self.assertEqual(chooser.choose({})['action'], 'finish')
+
+    def test_llm_parser_accepts_object_and_content_block_variants(self):
+        action = {'action': 'move_to_named_pose', 'pose': 'inspection', 'reason': 'Inspect'}
+        for content in (action, [{'type': 'text', 'text': json.dumps(action)}], json.dumps(action)):
+            body = json.dumps({'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]})
+            self.assertEqual(decode_action_response(body), action)
+
+    def test_llm_parser_reports_response_shape(self):
+        with self.assertRaisesRegex(AgentError, 'finish_reason=length'):
+            decode_action_response(json.dumps({'choices': [{'finish_reason': 'length', 'message': {}}]}))
+
     def test_ros_executor_uses_private_context_and_closes_before_context(self):
         events = []
         context, node, executor = MagicMock(), MagicMock(), MagicMock()
@@ -170,7 +185,7 @@ class AgentTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, 'reviewed_hardware'):
             Settings.parse(c)
         c = config()
-        c['named_poses']['inspection']['delta_from_start_rad'][0] = 0.3
+        c['named_poses']['inspection']['delta_from_start_rad'][0] = 0.31
         with self.assertRaisesRegex(AgentError, 'excursion'):
             Settings.parse(c).resolve([0] * 7)
 
@@ -264,22 +279,134 @@ class TrajectoryTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(AgentError):
                 validate_trajectory(t, start, goal, start, settings)
 
+    def test_excursion_reports_largest_path_deviation_not_only_endpoint(self):
+        settings = Settings.parse(config())
+        t = self.trajectory()
+        middle = deepcopy(t.points[1])
+        middle.time_from_start.sec = 1
+        middle.positions = [0., 0., 0., -.45, 0., 0., 0.]
+        t.points.insert(1, middle)
+        with self.assertRaisesRegex(AgentError, 'joint4 displacement 0.450000') as raised:
+            validate_trajectory(t, [0.] * 7, t.points[-1].positions, [0.] * 7, settings)
+        self.assertIn('limit 0.300000 rad, excess 0.150000 rad', str(raised.exception))
+        self.assertIn('time 1.000000 s', str(raised.exception))
+
+    def test_timeout_reports_full_path_after_first_failing_timestamp(self):
+        t = self.trajectory()
+        t.points[1].time_from_start.sec = 31
+        last = deepcopy(t.points[1])
+        last.time_from_start.sec = 45
+        last.positions[3] = -.45
+        t.points.append(last)
+        with self.assertRaisesRegex(AgentError, 'exceeds execution timeout') as raised:
+            validate_trajectory(t, [0.] * 7, last.positions, [0.] * 7, Settings.parse(config()))
+        message = str(raised.exception)
+        for detail in ('point index 1', 'timestamp 31.000000 s', 'timeout 30.000000 s',
+                       'duration if timing is valid) 45.000000 s',
+                       'joint4 displacement 0.450000 rad', 'excess 0.150000 rad'):
+            self.assertIn(detail, message)
+
+    def test_malformed_timing_has_distinct_reason_and_context(self):
+        for stamp, reason in ((0, 'do not strictly increase'), (-1, 'negative'),
+                              (float('nan'), 'nonfinite'), (float('inf'), 'nonfinite')):
+            with self.subTest(stamp=stamp):
+                t = self.trajectory()
+                t.points[1].time_from_start.sec = stamp
+                with self.assertRaisesRegex(AgentError, reason) as raised:
+                    validate_trajectory(t, [0.] * 7, t.points[1].positions,
+                                        [0.] * 7, Settings.parse(config()))
+                self.assertIn('point index 1', str(raised.exception))
+                self.assertIn('previous timestamp 0.000000 s', str(raised.exception))
+                self.assertIn('joint1 displacement 0.020000 rad', str(raised.exception))
+
+    def test_execution_timeout_boundary_is_accepted(self):
+        t = self.trajectory()
+        t.points[1].time_from_start.sec = 30
+        result = validate_trajectory(t, [0.] * 7, t.points[1].positions,
+                                     [0.] * 7, Settings.parse(config()))
+        self.assertEqual(result['duration_s'], 30.)
+
+    def test_plan_accepts_new_excursion_boundary_and_rejects_beyond(self):
+        settings = Settings.parse(config())
+        t = self.trajectory()
+        t.points[1].positions[0] = -.30
+        t.points[1].time_from_start.sec = 20
+        result = validate_trajectory(t, [0.] * 7, t.points[-1].positions, [0.] * 7, settings)
+        self.assertEqual(result['peak_excursion_rad'], .30)
+        t.points[1].positions[0] = -.301
+        with self.assertRaisesRegex(AgentError, 'joint1 displacement 0.301000'):
+            validate_trajectory(t, [0.] * 7, t.points[-1].positions, [0.] * 7, settings)
+
 
 class GuardTests(unittest.TestCase):
+    def test_expanded_stream_envelope_keeps_tracking_and_feedback_bounds(self):
+        guard = StreamGuard([0.] * 7, .04, 0)
+        for i in range(301):
+            q = [i * .001] + [0.] * 6
+            guard.command(q, q, 100. + i * .1, 100. + i * .1, i * .1)
+        q = [.301] + [0.] * 6
+        with self.assertRaisesRegex(AgentError, 'excursion bounds: joint1'):
+            guard.command(q, q, 130.1, 130.1, 30.1)
+        guard = StreamGuard([0.] * 7, .04, 0)
+        guard.check_feedback([.31] + [0.] * 6, [0.] * 7, .04, .01)
+        with self.assertRaisesRegex(AgentError, 'envelope: joint1'):
+            guard.check_feedback([.311] + [0.] * 6, [0.] * 7, .04, .02)
+        with self.assertRaisesRegex(AgentError, 'tracking bounds'):
+            guard.command([.20] + [0.] * 6, [.18] + [0.] * 6, 100., 100., .03)
+
     def test_velocity_trip_retains_offending_feedback_and_command(self):
         guard = StreamGuard([0.] * 7, .04, 0)
         guard.command([0.] * 7, [0.] * 7, 100., 100., .01)
         speeds = [0.] * 7
         speeds[3] = -.125
+        guard.check_feedback([0.] * 7, speeds, .04, .01,
+                             velocity_timestamps=[99.94] * 7, wall_now=99.99)
         with self.assertRaisesRegex(AgentError, 'joint4 -0.125000') as raised:
-            guard.check_feedback([0.] * 7, speeds, .04, .02)
+            guard.check_feedback([0.] * 7, speeds, .04, .02,
+                                 velocity_timestamps=[99.95] * 7, wall_now=100.)
         history = raised.exception.history
         self.assertEqual(history[0]['event'], 'command_received')
         self.assertEqual(history[-1]['velocities_rad_s'][3], -.125)
+        for age in history[-1]['motor_velocity_ages_s']:
+            self.assertAlmostEqual(age, .05)
         self.assertEqual(history[-1]['last_command_rad'], (0.,) * 7)
 
+    def test_feedback_history_compares_motor_velocity_to_position_packets(self):
+        guard = StreamGuard([0.] * 7, .04, 0)
+        guard.check_feedback([0.] * 7, [0.] * 7, .04, .01,
+                             position_timestamps=[1.] * 4)
+        guard.check_feedback([.001] + [0.] * 6, [.09] + [0.] * 6, .04, .02,
+                             position_timestamps=[1.01] * 4)
+        event = guard.history[-1]
+        self.assertAlmostEqual(event['joint_finite_difference_velocities_rad_s'][0], .1)
+        self.assertAlmostEqual(event['motor_minus_position_velocity_rad_s'][0], -.01)
+
+    def test_motor_limit_can_be_explicitly_raised_but_position_limit_remains(self):
+        guard = StreamGuard([0.] * 7, .04, 0, motor_velocity_limit=.11)
+        guard.check_feedback([0.] * 7, [.105] + [0.] * 6, .04, .01,
+                             position_timestamps=[1.] * 4)
+        with self.assertRaisesRegex(AgentError, 'Position-derived velocity'):
+            guard.check_feedback([.002] + [0.] * 6, [.105] + [0.] * 6, .04, .02,
+                                 position_timestamps=[1.01] * 4)
+
+    def test_position_velocity_limit_accepts_up_to_point_fifteen(self):
+        for speed in (-.151, -.15, -.106672, .106672, .15, .151):
+            with self.subTest(speed=speed):
+                guard = StreamGuard([0.] * 7, .04, 0)
+                guard.check_feedback([0.] * 7, [0.] * 7, .04, .01,
+                                     position_timestamps=[1.] * 4)
+                # Exact binary time interval avoids rounding at the boundary.
+                q = [0.] * 4 + [speed * .125] + [0.] * 2
+                if abs(speed) <= .15:
+                    guard.check_feedback(q, [0.] * 7, .04, .135,
+                                         position_timestamps=[1.125] * 4)
+                else:
+                    with self.assertRaisesRegex(AgentError, 'Position-derived velocity exceeded 0.150 rad/s: joint5'):
+                        guard.check_feedback(q, [0.] * 7, .04, .135,
+                                             position_timestamps=[1.125] * 4)
+
     def test_watchdogs_and_gripper_motion_abort(self):
-        for now, width, velocity in ((0.3, .04, 0), (0.1, .05, 0), (0.1, .04, .125)):
+        for now, width, velocity in ((0.3, .04, 0), (0.1, .05, 0), (0.1, .04, .201)):
             guard = StreamGuard([0] * 7, .04, 0)
             with self.assertRaises(AgentError):
                 guard.check_feedback([0] * 7, [velocity] * 7, width, now)
@@ -287,6 +414,34 @@ class GuardTests(unittest.TestCase):
         guard.command_at = 1
         with self.assertRaisesRegex(AgentError, 'heartbeat'):
             guard.check_feedback([0] * 7, [0] * 7, .04, 1)
+
+    def test_motor_filter_rejects_isolated_spike_from_recorded_run(self):
+        guard = StreamGuard([0.] * 7, .04, 0, motor_velocity_limit=.15)
+        for i, speed in enumerate((-.022, -.013, -.019, -.002, -.022, -.157, -.022)):
+            guard.check_feedback([0.] * 7, [0., 0., speed, 0., 0., 0., 0.],
+                                 .04, i * .01, velocity_timestamps=[100 + i * .01] * 7)
+
+    def test_motor_filter_stops_sustained_or_alternating_overspeed(self):
+        for speeds in ((.16, .16), (.16, -.16), (.16, .01, .16)):
+            guard = StreamGuard([0.] * 7, .04, 0, motor_velocity_limit=.15)
+            for i, speed in enumerate(speeds[:-1]):
+                guard.check_feedback([0.] * 7, [speed] * 7, .04, i * .01)
+            with self.assertRaisesRegex(AgentError, '3-sample median'):
+                guard.check_feedback([0.] * 7, [speeds[-1]] * 7, .04, (len(speeds)-1) * .01)
+
+    def test_motor_filter_does_not_recount_cache_or_reuse_old_spikes(self):
+        guard = StreamGuard([0.] * 7, .04, 0, motor_velocity_limit=.15)
+        for now, stamp in ((0., 100.), (.01, 100.), (.02, 100.), (.04, 100.04)):
+            guard.check_feedback([0.] * 7, [.16] * 7, .04, now,
+                                 velocity_timestamps=[stamp] * 7)
+        with self.assertRaisesRegex(AgentError, '3-sample median'):
+            guard.check_feedback([0.] * 7, [.16] * 7, .04, .05,
+                                 velocity_timestamps=[100.05] * 7)
+
+    def test_motor_filter_hard_limit_is_immediate(self):
+        guard = StreamGuard([0.] * 7, .04, 0, motor_velocity_limit=.15)
+        with self.assertRaisesRegex(AgentError, 'instantaneous hard limit 0.300'):
+            guard.check_feedback([0.] * 7, [-.301] * 7, .04, .01)
 
     def test_initial_command_cannot_jump_from_mock_zero_to_hardware(self):
         guard = StreamGuard([1] * 7, .04, 0)
@@ -476,4 +631,43 @@ class RosExecutionTests(unittest.TestCase):
         with self.imports(), patch('nero_agent.ros_backend.time.monotonic', side_effect=[0, 4]):
             with self.assertRaisesRegex(AgentError, 'did not settle'):
                 b.execute({'token': 'test'})
+        self.assertEqual(b.stop_calls, [True])
+
+    def test_segment_waits_for_stricter_speed_and_sustained_standstill(self):
+        import itertools
+        b = self.backend()
+        b.executing_segment = True
+        b._wait = lambda future, *a, **k: (
+            NS(accepted=True, get_result_async=lambda: 'result') if future == 'goal_future' else
+            NS(status=4, result=NS(error_code=NS(val=1))))
+        b._spin = lambda: None
+        samples = []
+        def measured():
+            samples.append(True)
+            return {'joints_rad': [.02]+[0.]*6, 'gripper_width_m': .04,
+                    'velocities_rad_s': [.004 if len(samples) <= 3 else 0.]+[0.]*6}
+        b._fresh = measured
+        clock = itertools.count(1., .1)
+        with self.imports(), patch('nero_agent.ros_backend.time.monotonic', side_effect=lambda: next(clock)):
+            result = b.execute({'token': 'test'})
+        self.assertGreaterEqual(len(samples), 6)
+        self.assertEqual(result['velocities_rad_s'], [0.]*7)
+        self.assertEqual(b.stop_calls, [])
+
+    @patch('nero_agent.abort_policy.require_verified_controlled_abort')
+    def test_segment_setup_drift_rejects_before_action_without_replanning(self, capability):
+        b = self.backend()
+        b.hardware, b.gate, b.executing_segment = True, object(), True
+        initial = b.state()
+        moved = deepcopy(initial)
+        moved['joints_rad'][0] = .0006
+        states = iter([initial, moved])
+        b.state = lambda: next(states)
+        b._call = lambda *a, **k: NS(success=True)
+        b._plan_from_state = MagicMock()
+        b.executor.send_goal_async = MagicMock()
+        with self.imports(), self.assertRaisesRegex(AgentError, 'changed during hardware setup'):
+            b.execute({'token': 'test'})
+        b.executor.send_goal_async.assert_not_called()
+        b._plan_from_state.assert_not_called()
         self.assertEqual(b.stop_calls, [True])

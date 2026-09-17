@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 
-from .core import AgentError, OfflineBackend, ScriptedChooser, Settings, run_loop, strict_json
+from .core import AgentError, DirectPoseChooser, OfflineBackend, ScriptedChooser, Settings, run_loop, strict_json
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,15 +25,21 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument('--config', type=Path, default=ROOT / 'examples/nero-agent.mock.json')
         p.add_argument('--output', type=Path, default=ROOT / ('reports/agent-' + name + '.json'))
+        if name == 'capture':
+            p.add_argument('--tcp-pose', action='store_true', help='Include measured-state FK for tcp_link in base_link')
         if name == 'run':
             p.add_argument('--instruction', default='Move to inspection, then return to start.')
             choice = p.add_mutually_exclusive_group()
             choice.add_argument('--offline-demo', action='store_true', help='No ROS, LLM, collision checking or hardware')
             choice.add_argument('--scripted', action='store_true', help='Fixed inspection/start sequence instead of LLM')
+            choice.add_argument('--start-pose', metavar='NAME',
+                                help='Move once to this configured named pose, without contacting the LLM')
             p.add_argument('--model')
             p.add_argument('--execute', action='store_true', help='Execute plans; hardware requires per-action confirmation')
             p.add_argument('--abort-qualification-report', type=Path,
                            help='Passed moving-abort report required for hardware execution')
+            p.add_argument('--motor-velocity-limit', type=float,
+                           help='Temporary NERO motor-feedback trip limit in rad/s (0.10-0.15)')
             p.add_argument('--max-actions', type=int, default=8)
     args = parser.parse_args(argv)
     if args.command == 'doctor':
@@ -49,11 +55,14 @@ def main(argv=None):
             raise AgentError('Output must not overwrite configuration')
         settings = Settings.parse(strict_json(args.config.read_text()),
                                   require_review=args.command == 'commission-abort' or getattr(args, 'execute', False))
+        if getattr(args, 'start_pose', None) is not None and args.start_pose not in settings.named_poses:
+            raise AgentError('Unknown start pose: ' + args.start_pose)
         if args.command == 'commission-abort':
             from dataclasses import replace
             if settings.mode != 'hardware':
                 raise AgentError('commission-abort requires hardware configuration')
-            settings = replace(settings, max_velocity=.02, max_acceleration=.05, max_excursion=.012, timeout=4., tolerance=.000501)
+            settings = replace(settings, max_velocity=.02, max_acceleration=.05, max_excursion=.012,
+                               timeout=4., tolerance=.000501, mujoco_preflight=False, segmented_execution=False)
         offline = getattr(args, 'offline_demo', False)
         if offline and (settings.mode != 'mock' or args.execute):
             raise AgentError('--offline-demo forbids --execute and hardware configuration')
@@ -87,6 +96,10 @@ def main(argv=None):
             write_report(args.output, report)
             if event['event'] in ('decision', 'planned', 'action_result'):
                 print('%s: %s' % (event['event'], event.get('pose') or event.get('action') or event.get('status')), file=sys.stderr)
+            elif event['event'] == 'segment_completed':
+                print('Segment %d/%d: measured arrival and standstill confirmed' %
+                      (event['segment'], event['segment_count']), file=sys.stderr)
+        backend.segment_callback = record
         if args.command == 'commission-abort':
             from .commissioning import CRITERIA
             before = backend.state()
@@ -107,6 +120,9 @@ def main(argv=None):
             report.update(backend.commission_abort(plan))
         elif args.command == 'capture':
             report.update(status='captured', state=backend.state())
+            if args.tcp_pose:
+                report['tcp_pose'] = backend.tcp_pose(report['state'])
+                print(json.dumps({'tcp_pose': report['tcp_pose']}), flush=True)
         elif args.command in ('stop', 'validate-hold'):
             if args.command == 'validate-hold':
                 before = backend.state()
@@ -119,7 +135,9 @@ def main(argv=None):
             if args.command == 'validate-hold':
                 report['validation_scope'] = 'Position hold only; not a moving-trajectory abort qualification'
         else:
-            if offline or args.scripted:
+            if args.start_pose:
+                chooser = DirectPoseChooser(args.start_pose)
+            elif offline or args.scripted:
                 chooser = ScriptedChooser()
                 if 'inspection' not in settings.named_poses:
                     raise AgentError('The scripted smoke test requires a pose named inspection')
