@@ -1,0 +1,7 @@
+{
+  "reference_link": "gripper_base",
+  "position_m": [0.0, 0.0, 0.133],
+  "rpy_rad": [0.0, 0.0, 1.5707963267948966],
+  "calibration_status": "model_derived_unverified",
+  "description": "Original AgileX jaws: midpoint of the approximately 10 mm long innermost front contact faces (tip plane 0.138 m). +Z forward, +X toward gripper_link1, +Y completes a right-handed frame. Verify against installed jaws before physical use."
+}

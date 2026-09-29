@@ -196,7 +196,7 @@ class DriverAbortTests(unittest.TestCase):
                    'std_msgs.msg': NS(Empty=NS, String=NS),
                    'std_srvs.srv': NS(SetBool=NS, Trigger=NS),
                    'action_msgs.srv': NS(CancelGoal=NS(Request=NS)),
-                   'nero_experiment.hardware': NS(connect=connect, MAX_JOINT_SNAPSHOT_AGE_S=.055)}
+                   'nero_experiment.hardware': NS(connect=connect, MAX_JOINT_SNAPSHOT_AGE_S=.080)}
         with patch.dict('sys.modules', modules), patch('sys.argv', ['driver']):
             driver.main()
 
@@ -255,7 +255,7 @@ class DriverAbortTests(unittest.TestCase):
                    'std_msgs.msg': NS(Empty=NS, String=NS),
                    'std_srvs.srv': NS(SetBool=NS, Trigger=NS),
                    'action_msgs.srv': NS(CancelGoal=NS(Request=NS)),
-                   'nero_experiment.hardware': NS(connect=connect, MAX_JOINT_SNAPSHOT_AGE_S=.055)}
+                   'nero_experiment.hardware': NS(connect=connect, MAX_JOINT_SNAPSHOT_AGE_S=.080)}
         with patch.dict('sys.modules', modules), patch('sys.argv', ['driver', '--diagnose-feedback']):
             driver.main()
 

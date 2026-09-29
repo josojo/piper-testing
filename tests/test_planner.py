@@ -61,11 +61,11 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(scene.model.neq, 2)
         for name, value in OPEN_GRIPPER.items():
             self.assertAlmostEqual(scene.data.qpos[scene.model.joint(name).qposadr[0]], value)
-        np.testing.assert_allclose(self.planner.current_pose().position_m, [0, 0, 0.89301], atol=1e-6)
-        np.testing.assert_allclose(scene.model.site("grasp_center").quat,
-                                   scene.model.body("gripper_link").quat, atol=1e-6)
-        np.testing.assert_allclose(scene.model.site("grasp_center").pos,
-                                   scene.model.body("gripper_link1").pos, atol=1e-6)
+        np.testing.assert_allclose(self.planner.current_pose().position_m, [0, 0, 0.88801], atol=1e-6)
+        # In the straight model pose +Z points up and +X toward finger 1 (+Y).
+        rotation = scene.data.site_xmat[scene.site].reshape(3, 3)
+        np.testing.assert_allclose(rotation[:, 2], [0, 0, 1], atol=1e-5)
+        np.testing.assert_allclose(rotation[:, 0], [0, 1, 0], atol=1e-5)
         self.assertEqual(scene.model.body("apple").jntnum[0], 0)
 
     def test_proxies_enclose_every_mesh_at_multiple_poses(self):
@@ -297,7 +297,12 @@ class PlannerTests(unittest.TestCase):
                                  "--target", str(bad)], cwd=ROOT, capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stderr)["status"], "rejected")
-        self.assertFalse(any(name.startswith("pyAgxArm") for name in sys.modules))
+        # Other test modules may import the SDK in this runner. Check the
+        # planner's dependency isolation in its own interpreter instead.
+        isolated = subprocess.run([sys.executable, '-c',
+            'import nero_planner, sys; assert not any(n.startswith("pyAgxArm") for n in sys.modules)'],
+            cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(isolated.returncode, 0, isolated.stderr)
 
 
 class DistanceTests(unittest.TestCase):

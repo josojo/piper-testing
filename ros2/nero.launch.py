@@ -1,5 +1,6 @@
 """NERO + gripper MoveIt stack. Hardware uses feedback, never GenericSystem."""
 from pathlib import Path
+import sys
 import json
 import tempfile
 import xml.etree.ElementTree as ET
@@ -11,6 +12,9 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from moveit_configs_utils import MoveItConfigsBuilder
+# ros2 launch loads this file outside the project package search path.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from nero_agent.tool_frame import xacro_mappings
 
 
 def build(context):
@@ -29,6 +33,12 @@ def build(context):
         .trajectory_execution(file_path='config/moveit_controllers_none.yaml')
         .planning_pipelines(pipelines=['ompl'])
         .to_moveit_configs())
+    # Derive the offset from this exact vendor model, then expand with its
+    # supported TCP parameters. The same definition drives the MuJoCo site.
+    mappings.update(xacro_mappings(ET.fromstring(config.robot_description['robot_description'])))
+    config.robot_description = (MoveItConfigsBuilder('agx_arm', package_name='agx_arm_moveit')
+        .robot_description(file_path='config/agx_arm.urdf.xacro', mappings=mappings)
+        .to_moveit_configs().robot_description)
     # This experiment uses explicit collision boxes, not the vendor's example
     # point-cloud sensor. Do not auto-load its unavailable Octomap plugin.
     config.sensors_3d = {}

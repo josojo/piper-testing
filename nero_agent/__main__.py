@@ -155,6 +155,8 @@ def main(argv=None):
         return 2 if args.command == 'commission-abort' and report['status'] != 'passed' else 0
     except (Exception, KeyboardInterrupt) as error:
         report.update(status='rejected_or_aborted', reason=str(error) or type(error).__name__)
+        if hasattr(error, 'settling_diagnostics'):
+            report['settling_diagnostics'] = error.settling_diagnostics
         if backend is not None:
             if getattr(backend, 'last_stop_result', None) is not None:
                 report['controlled_abort'] = backend.last_stop_result

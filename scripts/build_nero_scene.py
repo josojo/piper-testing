@@ -8,6 +8,7 @@ are added to the resulting MJCF. The generated XML remains ignored.
 from __future__ import annotations
 
 import argparse
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -16,6 +17,9 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from nero_agent.tool_frame import tcp_in_link7
 DEFAULT_MODEL = ROOT / "models/nero/nero_description.urdf"
 DEFAULT_OUTPUT = ROOT / "models/nero/nero_scene.xml"
 JOINTS = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
@@ -27,7 +31,7 @@ def numbers(values) -> str:
     return " ".join(f"{value:.12g}" for value in values)
 
 
-def add_planning_geometry(root: ET.Element, model: mujoco.MjModel) -> None:
+def add_planning_geometry(root: ET.Element, model: mujoco.MjModel, tool_transform) -> None:
     """Enclose every imported mesh with a padded box in its compiled frame."""
     world = root.find("worldbody")
     bodies = {body.get("name"): body for body in world.findall(".//body")}
@@ -51,12 +55,11 @@ def add_planning_geometry(root: ET.Element, model: mujoco.MjModel) -> None:
             "contype": "1", "conaffinity": "1",
         })
 
-    # The two finger origins lie on the grasp-center plane. Use their midpoint
-    # at zero opening, with the gripper-base orientation (URDF +Z approach).
-    finger = bodies["gripper_link1"]
+    position, quaternion = tool_transform
+    x, y, z, w = quaternion
     ET.SubElement(bodies["link7"], "site", {
-        "name": "grasp_center", "pos": finger.get("pos", "0 0 0"),
-        "quat": bodies["gripper_link"].get("quat", "1 0 0 0"), "size": "0.006",
+        "name": "grasp_center", "pos": numbers(position),
+        "quat": numbers((w, x, y, z)), "size": "0.006",
         "rgba": "0 1 0 1", "group": "0",
     })
     # Recent MuJoCo versions import URDF mimic joints as equality constraints.
@@ -118,7 +121,7 @@ def build(model_path: Path, output_path: Path) -> None:
     for geom in worldbody.findall(".//geom"):
         geom.set("contype", "0")
         geom.set("conaffinity", "0")
-    add_planning_geometry(root, model)
+    add_planning_geometry(root, model, tcp_in_link7(ET.parse(model_path).getroot()))
 
     ET.SubElement(worldbody, "geom", {
         "name": "table",

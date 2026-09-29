@@ -78,7 +78,7 @@ MAX_FEEDBACK_AGE_S = 0.25
 MAX_FEEDBACK_SKEW_S = 0.15
 # Joint packets are read sequentially from the SDK. Keep a small allowance for
 # read/ROS scheduling jitter while retaining the tighter packet-skew check.
-MAX_JOINT_SNAPSHOT_AGE_S = 0.055
+MAX_JOINT_SNAPSHOT_AGE_S = 0.080
 MAX_JOINT_SNAPSHOT_SKEW_S = 0.020
 START_MATCH_RAD = 0.001
 SETTLE_TOLERANCE_RAD = 0.0005

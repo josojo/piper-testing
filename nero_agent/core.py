@@ -152,9 +152,6 @@ class Settings:
                 continue
             q = (vector(spec['joints_rad']) if 'joints_rad' in spec else
                  tuple(a + b for a, b in zip(start, vector(spec['delta_from_start_rad']))))
-            if distance(q, start) > self.max_excursion:
-                raise AgentError('Named pose %s exceeds excursion limit: %s' %
-                                 (name, excursion_detail(q, start, self.max_excursion)))
             targets[name] = q
         return targets
 
@@ -262,6 +259,12 @@ def run_loop(backend, chooser, settings, instruction, execute, record, confirm, 
             result = {'status': 'observed', 'state': backend.state(), 'action': 'get_state'}
         else:
             goal = targets[action['pose']]
+            # Unselected saved poses must not block this action. Cartesian
+            # goals are checked after IK by the trajectory validator.
+            if not isinstance(goal, dict) and distance(goal, initial['joints_rad']) > settings.max_excursion:
+                raise AgentError('Named pose %s exceeds excursion limit: %s' %
+                                 (action['pose'], excursion_detail(
+                                     goal, initial['joints_rad'], settings.max_excursion)))
             plan = backend.plan(goal)
             record({'event': 'planned', 'pose': action['pose'], 'plan': plan})
             if not execute:

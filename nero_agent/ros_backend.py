@@ -11,11 +11,11 @@ import uuid
 from .core import AgentError, JOINTS, distance, vector, excursion_detail
 
 
-# Target 0.02 rad/s from the model's 0.08 rad/s cap while characterizing tracking.
+# Use the model's 0.08 rad/s cap, subject to any lower configured limit.
 # The independent hardware trip threshold is configured separately.
-PLANNING_VELOCITY_SCALING = 0.25
-# Target 0.03 rad/s² from the model's 0.15 rad/s² acceleration cap.
-PLANNING_ACCELERATION_SCALING = 0.2
+PLANNING_VELOCITY_SCALING = 1.0
+# Target 0.135 rad/s², leaving margin below the 0.15 rad/s² preflight cap.
+PLANNING_ACCELERATION_SCALING = 0.90
 
 
 def configure_goal_orientation(constraint, target):
@@ -257,8 +257,8 @@ class RosBackend:
         motion.start_state.joint_state.position = list(before_joints) + [before['gripper_width_m']]
         p = Pose(); p.position.x, p.position.y, p.position.z = map(float, target['position_m'])
         p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w = map(float, target['orientation_xyzw'])
-        # The vendor MoveIt group exposes tcp_link as its IK tip. The physical
-        # gripper links are present in the URDF but are not solver tip links.
+        # tcp_link is the shared contact-center frame configured by the launch;
+        # the vendor arm group already exposes it as its IK tip.
         pos = PositionConstraint(); pos.header.frame_id = 'base_link'; pos.link_name = 'tcp_link'
         pos.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[0.004] * 3)]
         pos.constraint_region.primitive_poses = [p]; pos.weight = 1.0
@@ -275,6 +275,12 @@ class RosBackend:
         goal = vector(trajectory.joint_trajectory.points[-1].positions)
         summary = validate_trajectory(trajectory.joint_trajectory, before_joints, goal,
                                       self.initial, self.settings)
+        if self.settings.mujoco_preflight:
+            from .mujoco_preflight import retime_interpolation
+            timing = retime_interpolation(trajectory.joint_trajectory, self.settings)
+            summary = validate_trajectory(trajectory.joint_trajectory, before_joints, goal,
+                                          self.initial, self.settings)
+            summary.update(timing)
         summary.update(self._mujoco_preflight(description, trajectory, before))
         return trajectory, digest, summary, goal
 
@@ -413,6 +419,12 @@ class RosBackend:
         from .trajectory import validate_trajectory
         summary = validate_trajectory(trajectory.joint_trajectory, before_joints, goal,
                                       self.initial, self.settings)
+        if self.settings.mujoco_preflight:
+            from .mujoco_preflight import retime_interpolation
+            timing = retime_interpolation(trajectory.joint_trajectory, self.settings)
+            summary = validate_trajectory(trajectory.joint_trajectory, before_joints, goal,
+                                          self.initial, self.settings)
+            summary.update(timing)
         summary.update(self._mujoco_preflight(description, trajectory, before))
         return trajectory, digest, summary
 
@@ -480,10 +492,15 @@ class RosBackend:
             if result.status != GoalStatus.STATUS_SUCCEEDED or result.result.error_code.val != MoveItErrorCodes.SUCCESS:
                 raise AgentError('MoveIt execution failed: status %d, error %d' % (result.status, result.result.error_code.val))
             # Action success alone is insufficient: require measured arrival and dwell.
+            from .settling import SettlingDiagnostics
+            settling = SettlingDiagnostics(goal, self.settings.tolerance,
+                                           STOPPED_SPEED if segment else .01,
+                                           STOP_DWELL if segment else .3)
             deadline, stable = time.monotonic() + 3.0, None
             while time.monotonic() < deadline:
                 self._spin()
                 actual = self._fresh()
+                settling.observe(actual, time.monotonic())
                 if (distance(actual['joints_rad'], goal) <= self.settings.tolerance
                         and max(map(abs, actual['velocities_rad_s'])) <= (STOPPED_SPEED if segment else .01)):
                     stable = stable or time.monotonic()
@@ -492,7 +509,10 @@ class RosBackend:
                 else:
                     stable = None
             else:
-                raise AgentError('Controller completed but measured arm did not settle at goal')
+                error = AgentError('Controller completed but measured arm did not settle at goal; '
+                                   'settling_diagnostics=' + json.dumps(settling.result()))
+                error.settling_diagnostics = settling.result()
+                raise error
             if self.hardware:
                 gate = self._call(self.gate, SetBool.Request(data=False))
                 if not gate.success:

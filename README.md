@@ -88,6 +88,29 @@ Compare `read_errors`, packet ages, `timer_interval_s`, and `read_duration_s` wi
 
 ### Camera-down photo goals and current tool pose
 
+MoveIt `tcp_link` and the standalone MuJoCo `grasp_center` now use the shared
+definition in `nero_agent/tool_frame.json`: the midpoint of the original jaws'
+front inner contact faces, 133 mm along `gripper_base` +Z. This is a model-derived
+value awaiting measurement of the installed jaws. +Z points out of the gripper,
++X points toward `gripper_link1`, and +Y completes a right-handed frame. Quaternion
+xyzw `[0, 0, 0, 1]` aligns these tool axes with `base_link`; position `[0, 0, 1]`
+only places the TCP one metre above the base and does not specify orientation.
+
+The previous MoveIt TCP coincided with `link7`. The local configuration was
+migrated, with its original saved as `reports/nero-agent.before-gripping-tcp.json`.
+To convert another **legacy** configuration once, use
+`python scripts/migrate_nero_tcp_poses.py old.json new.json`. This preserves each
+reference flange pose, but converts free-yaw goals to fixed reference orientations.
+Never apply it to already converted goals. Joint goals need no conversion.
+Old trajectory reports and scene fingerprints must be regenerated.
+
+After editing the shared definition, restart the ROS stack and rebuild the
+standalone scene with `python scripts/build_nero_scene.py`. In RViz, show TF axes
+for `tcp_link`: blue Z should point forward, red X toward finger 1, and the origin
+should sit between the inner contact surfaces at their longitudinal midpoint.
+Check at different openings and several arm postures. A centered physical
+reference verifies the installed jaws; a model screenshot alone does not.
+
 Cartesian ROS named poses optionally accept `"orientation_mode": "camera_down_free_yaw"`.
 Omitting it (or using `"fixed"`) preserves the existing orientation tolerances.
 The free-yaw mode requires a reference quaternion whose tool +Z points along
@@ -97,8 +120,11 @@ MoveIt's XYZ Euler orientation-error parameterization. It assumes the camera
 looks along tcp_link +Z; verify your physical mounting. It constrains the
 **destination**, not camera orientation throughout the route, and does not
 guarantee the closest joint solution. Collision, tracking, speed, joint and
-segmented-preflight checks are unchanged. Only `table_photo_center` in the
-local hardware configuration opts into this mode; its coordinates are preserved.
+segmented-preflight checks are unchanged. The legacy local photo goals have been converted from the old `link7` TCP to
+the gripping TCP, preserving their reference physical flange poses.
+`table_photo_center` now uses a fixed orientation: its old free-yaw camera axis
+is not the new gripping +Z axis. Verify the camera mounting before enabling
+this mode for any migrated goal.
 
 With other controllers stopped, capture the current modeled tool pose without
 planning or executing a motion:
@@ -203,7 +229,7 @@ sudo ./scripts/nero_ros2.sh hardware nero-agent.local.json --scripted --execute 
 
 Each physical motion requires typing `EXECUTE`. Start with the deterministic test before using LLM choices. A failure ends the sequence without an automatic return or retry. Initial hardware testing must establish tracking and stop behavior; this bridge has not yet been physically validated.
 
-MoveIt planning currently targets 0.02 rad/s velocity and 0.03 rad/s² acceleration through scaling of the model's 0.08 rad/s and 0.15 rad/s² caps. Plans and streamed commands allow a 0.30 rad (about 17°) maximum per-joint excursion from their captured start; measured feedback has an additional 0.01 rad margin. Trajectory excursion rejections report the joint with the largest displacement, its start and planned position, excess over the limit, and trajectory time. Accepted plan summaries include peak excursion. The execution timeout remains 30 seconds; commissioning retains its tighter limits. This allowance does not guarantee that a Cartesian photo target is reachable within the envelope.
+MoveIt planning targets 0.08 rad/s velocity and 0.135 rad/s² acceleration (global scaling factors of 1.0 and 0.90), subject to any lower configured limits. Acceleration planning leaves margin below the 0.15 rad/s² preflight cap. With MuJoCo preflight enabled, a timing pass also bounds the controller’s quintic velocity and acceleration between waypoints and uniformly slows trajectories when needed, scaling waypoint derivatives consistently. The resulting trajectory must pass timing, excursion, and clearance validation; reports include the interpolation time scale and original derivative bounds. Plans and streamed commands allow a 0.30 rad (about 17°) maximum per-joint excursion from their captured start; measured feedback has an additional 0.01 rad margin. Trajectory excursion rejections report the joint with the largest displacement, its start and planned position, excess over the limit, and trajectory time. Accepted plan summaries include peak excursion. The execution timeout remains 30 seconds; commissioning retains its tighter limits. This allowance does not guarantee that a Cartesian photo target is reachable within the envelope.
 
 MoveIt sends the timed trajectory to the ROS2 `joint_trajectory_controller`; the hardware bridge forwards controller position targets through the vendor's ordinary `move_j` position interface. The unsmoothed instantaneous SDK `move_js` interface is not used for trajectory execution. The bridge retains the default 0.10 rad/s motor-feedback guard (optionally raised with `--motor-velocity-limit` up to 0.15 rad/s), using the median of the last three fresh absolute-speed samples within 30 ms (two over-limit samples trip, including at startup; repeated cached packets do not count). A raw sample above twice the configured motor limit still trips immediately. This filter typically adds one 10 ms polling interval to sustained-overspeed detection and is not hardware-qualified. The bridge also retains an independent 0.15 rad/s position-derived velocity check, fresh-feedback checks, tracking bounds, and a command/heartbeat watchdog. It reuses the pinned SDK and firmware-specific acceleration encoding/readback correction. These checks can reject a trajectory; they do not establish physical tracking performance in advance.
 
@@ -483,7 +509,7 @@ Without `--viewer`, execution is headless kinematic playback. With it, the viewe
 
 The target interface accepts `frame`, `position_m`, `orientation_xyzw`, optional `gripper`, and optional text `reason`. Only `frame="nero_base"` and `gripper=1.0` are supported in this milestone. A quaternion must be finite and unit length within 0.001; small roundoff is normalized, and opposite quaternion signs are equivalent. Unknown fields, unsupported frames, nonfinite numbers, and gripper movement requests are rejected.
 
-The controlled `grasp_center` site is the midpoint of the two finger joint origins at zero opening, using the gripper-base orientation (+Z approach direction). It lies 0.138 m along the vendor gripper-base +Z axis. The fixed transform is derived from the compiled URDF, including the flange attachment, and the site is attached to `link7`. In the zero arm pose it is approximately `[0, 0, 0.89301]` metres in `nero_base`. This convention is a model tool frame, not a measured physical TCP calibration.
+The controlled `grasp_center` site uses the same contact-center definition as MoveIt `tcp_link`, in `nero_agent/tool_frame.json`. Its origin lies 0.133 m along `gripper_base` +Z, approximately halfway along the original jaws’ front inner contact faces (extending about 10 mm back from the 0.138 m tip plane). Tool +Z points forward; +X points toward `gripper_link1` along the opening direction; +Y completes the right-handed frame. In the zero arm pose its position is approximately `[0, 0, 0.88801]` metres in `nero_base`, with quaternion xyzw `[0, 0, 0.70710678, 0.70710678]`. The transform is composed with the vendor fixed flange chain and attached to `link7`, independent of opening width. This is a model-derived provisional TCP, not a measured physical calibration; check the installed contact surfaces before hardware use.
 
 ### Planning and validation defaults
 
@@ -675,7 +701,7 @@ The operator must type `EXECUTE` after successful simulation and preflight. Any 
 | Position tolerance for settling | 0.0005 rad for at least 0.3 s |
 | Certified tracking envelope | Endpoint joint bounds expanded by 0.002 rad |
 | Required collision clearance | 0.005 m throughout each checked envelope |
-| Joint packet age / inter-packet skew | At most 55 ms / 20 ms |
+| Joint packet age / inter-packet skew | At most 80 ms / 20 ms |
 | Other feedback packet age / overall skew | At most 250 ms / 150 ms |
 | Motor velocity trip threshold | 0.10 rad/s; joint finite-difference cross-check at 0.11 rad/s |
 | Polling period | 20 ms, subject to OS and SDK scheduling |
@@ -683,7 +709,7 @@ The operator must type `EXECUTE` after successful simulation and preflight. Any 
 
 The three-request default reduces LLM cost by choosing larger prevalidated waypoints. It does not raise the simulated speed or acceleration limits: those remain 0.08 rad/s and 0.15 rad/s². `move_j` performs controller-side interpolation, not the exact quintic timing seen in simulation. The adapter splits each waypoint into at most 0.002 rad joint microsteps, uses a 1% controller speed setting, and settles each command from measured feedback. It certifies a whole joint-angle box for each microstep, including a tracking margin: every combination of joint positions within that box has the required modeled clearance. This accounts for differing joint timing. The upright experiment uses a 5 mm minimum clearance so closer modeled link pairs can pass; this is a small model-based margin and can still be less than the collision-proxy model error. Review the geometry against the real setup before any physical execution. Conservative geometry-motion bounds can still reject a move even when a line-path simulation passes. A run may reject the three-waypoint plan if any large segment cannot be certified within the configured joint, translation, clearance or duration limits.
 
-The monitor checks fresh joint, motor, driver and arm-status feedback; bounds joint position and measured speed; and waits for measured arrival, not just an idle flag. Before a command, joint age/skew failures reset the settling dwell and are resampled within the existing 5-second stationary timeout. Every accepted joint snapshot must still meet the 55 ms age / 20 ms skew limits; the 5 ms age allowance covers sequential SDK reads and observed ROS scheduling jitter, not missing feedback. During an active move, timing failures still abort immediately. Timing errors include individual packet ages and skew; controller/driver faults are not retried by the stationary check. Execution report updates reuse serialized trajectories to reduce interference with the SDK receiver thread. A fault, timeout, stale packet, tracking deviation or Ctrl-C during execution triggers a best-effort electronic stop and cancels the remaining outward/return commands. Reports record the measured state and goal before each command and the achieved state after settling; an aborted report explicitly indicates that physical motion may have occurred. A motor or finite-difference velocity trip also records a `velocity_limit_exceeded` event with the source, joint, threshold, goal, elapsed command time, and up to 26 recent feedback snapshots (roughly 0.5 seconds at nominal polling, including the offending sample). Snapshots contain joint positions, motor velocities and packet timestamps. The buffer stays in memory during motion; serialization and report writing happen only after the electronic stop has been attempted, including when stop delivery fails. Diagnostic report failures do not replace the original motion/stop error.
+The monitor checks fresh joint, motor, driver and arm-status feedback; bounds joint position and measured speed; and waits for measured arrival, not just an idle flag. Before a command, joint age/skew failures reset the settling dwell and are resampled within the existing 5-second stationary timeout. Every accepted joint and motor-velocity snapshot must meet the 80 ms age / 20 ms skew limits. The age allowance accommodates sequential SDK reads and scheduling delays; samples older than 80 ms are rejected. During an active move, timing failures still abort immediately. Timing errors include individual packet ages and skew; controller/driver faults are not retried by the stationary check. Execution report updates reuse serialized trajectories to reduce interference with the SDK receiver thread. A fault, timeout, stale packet, tracking deviation or Ctrl-C during execution triggers a best-effort electronic stop and cancels the remaining outward/return commands. Reports record the measured state and goal before each command and the achieved state after settling; an aborted report explicitly indicates that physical motion may have occurred. A motor or finite-difference velocity trip also records a `velocity_limit_exceeded` event with the source, joint, threshold, goal, elapsed command time, and up to 26 recent feedback snapshots (roughly 0.5 seconds at nominal polling, including the offending sample). Snapshots contain joint positions, motor velocities and packet timestamps. The buffer stays in memory during motion; serialization and report writing happen only after the electronic stop has been attempted, including when stop delivery fails. Diagnostic report failures do not replace the original motion/stop error.
 
 This Python process is not a real-time safety controller. Polling can miss between-sample deviations, CAN/software stops can fail, and process termination or power loss can prevent cleanup. The simulator does not validate real acceleration, stopping distance, payload dynamics or controller tracking. Full extension can be singular; a controller singularity status aborts the experiment rather than forcing the last move. Physical validation, refined collision exclusions and an independent stop remain necessary. Automated motion tests use fake feedback. The corrected acceleration setup has also been checked on a physical NERO 1.21 without sending motion commands; all seven joints read back 0.15 rad/s² (see `reports/acceleration-setup-verified-20260916.json`). This does not validate trajectory tracking during physical execution.
 

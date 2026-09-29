@@ -186,8 +186,35 @@ class AgentTests(unittest.TestCase):
             Settings.parse(c)
         c = config()
         c['named_poses']['inspection']['delta_from_start_rad'][0] = 0.31
+        settings = Settings.parse(c)
+        backend = OfflineBackend(settings)
+        backend.plan = MagicMock()
         with self.assertRaisesRegex(AgentError, 'excursion'):
-            Settings.parse(c).resolve([0] * 7)
+            run_loop(backend, DirectPoseChooser('inspection'), settings, 'test', False,
+                     lambda _: None, lambda _: True)
+        backend.plan.assert_not_called()
+
+    def test_unused_out_of_bounds_pose_does_not_block_selected_goal(self):
+        for cartesian in (False, True):
+            with self.subTest(cartesian=cartesian):
+                c = config()
+                c['named_poses']['unused'] = {'joints_rad': [0., 0., 3.252383, 0., 0., 0., 0.]}
+                if cartesian:
+                    c['named_poses']['inspection'] = {
+                        'frame': 'base_link', 'position_m': [.3, 0., .2],
+                        'orientation_xyzw': [1., 0., 0., 0.]}
+                settings = Settings.parse(c)
+                backend = OfflineBackend(settings)
+                backend.plan = MagicMock(return_value={'goal': [0.] * 7})
+                result = run_loop(backend, DirectPoseChooser('inspection'), settings, 'test', False,
+                                  lambda _: None, lambda _: True)
+                self.assertEqual(result['status'], 'planned_only')
+                backend.plan.assert_called_once_with(settings.resolve([0.] * 7)['inspection'])
+                backend.plan.reset_mock()
+                with self.assertRaisesRegex(AgentError, 'Named pose unused exceeds excursion limit: joint3'):
+                    run_loop(backend, DirectPoseChooser('unused'), settings, 'test', False,
+                             lambda _: None, lambda _: True)
+                backend.plan.assert_not_called()
 
     def test_budget_limits_observation_loop(self):
         settings = Settings.parse(config())
@@ -629,8 +656,10 @@ class RosExecutionTests(unittest.TestCase):
         b._fresh = b.state
         # Advance past the measured arrival deadline without sleeping in tests.
         with self.imports(), patch('nero_agent.ros_backend.time.monotonic', side_effect=[0, 4]):
-            with self.assertRaisesRegex(AgentError, 'did not settle'):
+            with self.assertRaisesRegex(AgentError, 'did not settle') as raised:
                 b.execute({'token': 'test'})
+        self.assertEqual(raised.exception.settling_diagnostics['samples'], 0)
+        self.assertIn('settling_diagnostics=', str(raised.exception))
         self.assertEqual(b.stop_calls, [True])
 
     def test_segment_waits_for_stricter_speed_and_sustained_standstill(self):
