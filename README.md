@@ -244,7 +244,7 @@ increase.
 
 The local hardware configuration selects `"motion_profile": "mujoco_floor"`.
 This executes one continuous controller trajectory, without the forced 0.09-rad
-stop-and-settle legs. Interior caps are **0.20 rad/s and 0.50 rad/s²**. A uniform
+stop-and-settle legs. Interior caps are **0.10 rad/s and 0.25 rad/s²** to leave margin for observed tracking lag and feedback transport delay. A uniform
 retiming of the MoveIt curve preserves its path while allowing it to run faster
 than MoveIt's conservative initial timing. The captured-start allowance is
 2π rad per joint; loaded absolute joint limits still apply. The timeout is 600 s.
@@ -265,6 +265,8 @@ position-derived velocity trip limits. Near-floor
 motion retains the old stream/feedback limits and lowers firmware acceleration
 to 0.03 rad/s². Interior execution explicitly raises and verifies the firmware
 acceleration cap to 0.50 rad/s² while stationary; these settings remain afterward.
+This firmware response cap is separate from the planned 0.25 rad/s² acceleration,
+so firmware smoothing has response headroom without increasing planned speed.
 Restart the running stack after changing profiles. Existing heartbeat, tracking,
 fresh-feedback, scene-change, controlled-abort and self-collision checks remain.
 MuJoCo validation is adaptive, with more subdivision near geometric boundaries;
@@ -880,3 +882,15 @@ status polling. Invalid diagnostic messages are counted and discarded. Missing
 controller samples are visible as an empty sample list. No tracking-error filter
 or tolerance change is applied; the 0.015-rad instantaneous bound remains in force.
 The same execution command enables capture automatically, with no image rebuild.
+
+
+Hardware controller tracking uses a rolling mean of the absolute error for each
+joint over up to five distinct controller-state samples, no older than 150 ms.
+The threshold remains 0.015 rad; startup uses available samples without zero
+padding. The bridge requests the existing controlled hold when the mean exceeds
+that threshold. The hardware launch disables the controller's duplicate raw
+path-error abort so it cannot preempt this filter. Goal tolerances are unchanged.
+The bridge still rejects individual commands more than 0.015 rad from fresh SDK
+positions, and MuJoCo still certifies that same instantaneous tracking allowance.
+Consequently, averaging delayed ROS feedback does not permit larger hardware
+tracking excursions and cannot guarantee completion when physical lag persists.

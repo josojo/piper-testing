@@ -34,7 +34,7 @@ class FloorMotionTests(unittest.TestCase):
         s = settings()
         self.assertTrue(s.floor_guard and s.mujoco_preflight)
         self.assertFalse(s.segmented_execution)
-        self.assertEqual((s.max_velocity, s.max_acceleration), (.2, .5))
+        self.assertEqual((s.max_velocity, s.max_acceleration), (.1, .25))
         self.assertEqual(s.max_excursion, FLOOR_EXCURSION_RAD)
         self.assertFalse(config().floor_guard)
 
@@ -44,7 +44,7 @@ class FloorMotionTests(unittest.TestCase):
         t = trajectory(q, goal, 40)
         original = bezier_segment(*t.points, 40)
         result = retime_interpolation(t, settings(), allow_speedup=True)
-        self.assertLess(result['interpolation_time_scale'], .1)
+        self.assertLess(result['interpolation_time_scale'], .2)
         end = t.points[-1].time_from_start
         duration = end.sec + end.nanosec*1e-9
         np.testing.assert_allclose(bezier_segment(*t.points, duration), original, atol=1e-9)
@@ -55,7 +55,7 @@ class FloorMotionTests(unittest.TestCase):
         self.assertEqual(result['speed_region'], 'interior')
         self.assertEqual(result['execution_mode'], 'continuous')
         self.assertEqual(len(t.points), 2)
-        self.assertLess(duration, 3.)
+        self.assertLess(duration, 6.)
         self.assertGreaterEqual(result['minimum_floor_clearance_bound_m'], .04)
 
     def test_clear_floor_move_is_interior(self):
@@ -69,8 +69,8 @@ class FloorMotionTests(unittest.TestCase):
         result = backend._mujoco_preflight(description(), NS(joint_trajectory=t),
                                            {'gripper_width_m': .04})['mujoco_preflight']
         self.assertEqual(result['speed_region'], 'interior')
-        self.assertEqual(result['velocity_limit_rad_s'], .2)
-        self.assertEqual(result['acceleration_limit_rad_s2'], .5)
+        self.assertEqual(result['velocity_limit_rad_s'], .1)
+        self.assertEqual(result['acceleration_limit_rad_s2'], .25)
         validate(description(), t, {'gripper_width_m': .04}, q,
                  settings())
         self.assertEqual(len(t.points), 2)
@@ -178,7 +178,7 @@ class FloorMotionTests(unittest.TestCase):
             self.assertFalse(node.gate(NS(data=True), NS()).success)
             hardware.configure_acceleration.assert_not_called()
             for near, acceleration, command_limit, measured_limit in (
-                    (False, .5, .25, .30), (True, .03, .10, .10)):
+                    (False, .50, .25, .30), (True, .03, .10, .10)):
                 self.assertTrue(node.set_floor_region(NS(data=near), NS()).success)
                 self.assertTrue(node.gate(NS(data=True), NS()).success)
                 self.assertIsNone(node.floor_near)

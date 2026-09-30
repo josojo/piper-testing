@@ -550,9 +550,34 @@ class RosExecutionTests(unittest.TestCase):
         return patch.dict('sys.modules', {
             'std_srvs.srv': NS(SetBool=NS(Request=NS)),
             'moveit_msgs.action': NS(ExecuteTrajectory=NS(Goal=NS)),
-            'moveit_msgs.msg': NS(MoveItErrorCodes=NS(SUCCESS=1)),
-            'action_msgs.msg': NS(GoalStatus=NS(STATUS_SUCCEEDED=4)),
+            'moveit_msgs.msg': NS(MoveItErrorCodes=NS(SUCCESS=1, PREEMPTED=-7)),
+            'action_msgs.msg': NS(GoalStatus=NS(STATUS_SUCCEEDED=4, STATUS_ABORTED=6)),
         })
+
+    def test_action_failure_preserves_driver_reason_arriving_during_stop(self):
+        for stop_failed in (False, True):
+            b = self.backend()
+            b._wait = lambda future, *a, **k: (
+                NS(accepted=True, get_result_async=lambda: 'result') if future == 'goal_future' else
+                NS(status=6, result=NS(error_code=NS(val=-7))))
+            def stop():
+                b.last_stop_result = {'reason': 'Controller mean tracking error exceeded: joint4 0.015029 rad'}
+                if stop_failed:
+                    raise AgentError('stop transport timed out')
+            b.stop = stop
+            with self.imports(), self.assertRaisesRegex(AgentError, 'joint4 0.015029') as raised:
+                b.execute({'token': 'test'})
+            self.assertIn('ABORTED (status 6), PREEMPTED (error -7)', str(raised.exception))
+            if stop_failed:
+                self.assertEqual(raised.exception.stop_error, 'stop transport timed out')
+
+    def test_execution_codes_without_driver_fault_remain_informative(self):
+        from nero_agent.ros_backend import MoveItExecutionError
+        error = MoveItExecutionError(6, -7, NS(STATUS_ABORTED=6), NS(PREEMPTED=-7))
+        error.attach_driver_reason(None, {'reason': 'Operator/application controlled abort'})
+        self.assertEqual(str(error), 'MoveIt execution failed: ABORTED (status 6), PREEMPTED (error -7)')
+        unknown = MoveItExecutionError(99, -99, NS(), NS())
+        self.assertIn('UNKNOWN (status 99), UNKNOWN (error -99)', str(unknown))
 
     def test_changed_arm_gripper_or_scene_cannot_execute_cached_plan(self):
         for change in ('arm', 'gripper', 'scene'):

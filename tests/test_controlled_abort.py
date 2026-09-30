@@ -223,9 +223,13 @@ class DriverAbortTests(unittest.TestCase):
             def destroy_node(self): pass
         def spin(node):
             node.guard = MagicMock()
+            node.guard.history = [{'event': 'command_received', 'stamp': 100.}]
             reply = node.stop_service(NS(), NS())
             self.assertTrue(reply.success)
             self.assertIsNone(node.guard)
+            self.assertEqual(node.abort_result(full=True)['tracking_diagnostic']['bridge_history'],
+                             [{'event': 'command_received', 'stamp': 100.}])
+            self.assertNotIn('tracking_diagnostic', node.abort_result(full=False))
             node.command(NS(name=['joint1'], position=[2.]))  # queued bad stream ignored
             hardware.robot.move_js.assert_not_called()
             node.abort.tick()

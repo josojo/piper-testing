@@ -95,7 +95,9 @@ def build(context):
             'joints': joints, 'command_interfaces': ['position'], 'state_interfaces': ['position', 'velocity'],
             'open_loop_control': False, 'allow_partial_joints_goal': False,
             'constraints': {'goal_time': 3.0, 'stopped_velocity_tolerance': 0.01,
-                **{j: {'trajectory': TRACKING_TOLERANCE_RAD, 'goal': 0.005} for j in joints}}}},
+                # Hardware bridge applies the five-sample controller mean and
+                # retains the instantaneous .015-rad fresh-hardware guard.
+                **{j: {'trajectory': -1.0 if mode == 'hardware' else TRACKING_TOLERANCE_RAD, 'goal': 0.005} for j in joints}}}},
     }
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
         yaml.safe_dump(controller_config, f)

@@ -18,6 +18,24 @@ PLANNING_VELOCITY_SCALING = 1.0
 PLANNING_ACCELERATION_SCALING = 0.90
 
 
+class MoveItExecutionError(AgentError):
+    """Preserve action codes while attaching the driver's eventual stop reason."""
+    def __init__(self, status, code, status_type, code_type):
+        def name(constants, value, prefix=''):
+            return next((key[len(prefix):] for key in dir(constants)
+                         if key.isupper() and key.startswith(prefix)
+                         and getattr(constants, key) == value), 'UNKNOWN')
+        self.context = 'MoveIt execution failed: %s (status %d), %s (error %d)' % (
+            name(status_type, status, 'STATUS_'), status, name(code_type, code), code)
+        super().__init__(self.context)
+
+    def attach_driver_reason(self, fault, report):
+        # An application-requested hold is a consequence, not the original cause.
+        reason = fault or (report or {}).get('reason')
+        if reason and reason != 'Operator/application controlled abort':
+            self.args = ('NERO driver stopped: %s; %s' % (reason, self.context),)
+
+
 def configure_goal_orientation(constraint, target):
     """Euler XYZ error relative to reference: constrain tilt, optionally free spin.
 
@@ -549,7 +567,8 @@ class RosBackend:
             result = self._wait(self.goal_handle.get_result_async(),
                                 (SEGMENT_TIMEOUT if segment else self.settings.timeout) + 5, monitor=True)
             if result.status != GoalStatus.STATUS_SUCCEEDED or result.result.error_code.val != MoveItErrorCodes.SUCCESS:
-                raise AgentError('MoveIt execution failed: status %d, error %d' % (result.status, result.result.error_code.val))
+                raise MoveItExecutionError(result.status, result.result.error_code.val,
+                                           GoalStatus, MoveItErrorCodes)
             # Action success alone is insufficient: require measured arrival and dwell.
             from .settling import SettlingDiagnostics
             settling = SettlingDiagnostics(goal, self.settings.tolerance,
@@ -585,6 +604,9 @@ class RosBackend:
             except Exception as stop_error:
                 # Keep the original execution failure; report stop failure separately.
                 error.stop_error = str(stop_error)
+            if isinstance(error, MoveItExecutionError):
+                error.attach_driver_reason(getattr(self, 'driver_fault', None),
+                                           getattr(self, 'last_stop_result', None))
             raise
 
     def commission_abort(self, plan):

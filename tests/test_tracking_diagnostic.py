@@ -7,6 +7,30 @@ from nero_agent.tracking_diagnostic import ControllerTrace
 
 
 class TrackingTests(unittest.TestCase):
+    def test_recorded_abort_hold_is_explained_but_remains_rejected(self):
+        trace = ControllerTrace()
+        actual = [0.]*7
+        actual[3] = .48417178779574693
+        desired = list(actual)
+        desired[3] = .4686765258896835
+        trace.observe(NS(joint_names=JOINTS, header=NS(stamp=NS(sec=100, nanosec=0)),
+                         actual=NS(positions=actual, velocities=[]),
+                         desired=NS(positions=desired, velocities=[]),
+                         error=NS(positions=[a-b for a, b in zip(desired, actual)], velocities=[])))
+        previous = list(actual)
+        previous[3] = .4699574375182084
+        guard = StreamGuard(previous, .04, 0, command_velocity_limit=.25)
+        guard.command(previous, previous, 100., 100., 0.)
+        with self.assertRaisesRegex(AgentError, 'velocity limit'):
+            guard.command(actual, actual, 100.009948015, 100.009948015, .01)
+        self.assertEqual(guard.last_command, tuple(previous))
+        self.assertIn('joint4 error -0.015495 rad', trace.hold_transition_reason(actual, 100.01))
+        self.assertIsNone(trace.hold_transition_reason(previous, 100.01))
+        self.assertIsNone(trace.hold_transition_reason(actual, 100.06))
+        self.assertIsNone(trace.hold_transition_reason(actual, 99.99))
+        trace.samples[-1]['error_positions_rad'] = [.014]*7
+        self.assertIsNone(trace.hold_transition_reason(actual, 100.01))
+
     def message(self):
         return NS(joint_names=list(reversed(JOINTS)), header=NS(stamp=NS(sec=100, nanosec=123)),
                   desired=NS(positions=list(range(7)), velocities=[.01]*7),
@@ -59,3 +83,26 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(row['max_command_delta_rad'], .01)
         self.assertEqual(row['previous_command_stamp'], 100.)
         self.assertEqual(guard.last_stamp, 100.)
+
+class TrackingMeanTests(unittest.TestCase):
+    def test_peak_is_filtered_and_sustained_error_trips(self):
+        from nero_agent.tracking_diagnostic import TrackingMean
+        f = TrackingMean()
+        def row(t, e):
+            return {'controller_stamp_unix_s': t, 'error_positions_rad': [e]*7}
+        for i in range(4):
+            self.assertIsNone(f.observe(row(i*.02, .014)))
+        self.assertIsNone(f.observe(row(.08, .015004)))
+        self.assertIsNone(f.observe(row(.08, .1)))  # duplicate does not count
+        for i in range(4):
+            result = f.observe(row(.1+i*.02, -.016))
+        self.assertIn('mean tracking error', result)
+        self.assertEqual(len(f.samples), 5)
+        self.assertIn('1 samples', f.observe(row(1., .016)))
+
+    def test_no_zero_padding_or_signed_cancellation(self):
+        from nero_agent.tracking_diagnostic import TrackingMean
+        f = TrackingMean()
+        for t, e in ((0., .016), (.02, -.016)):
+            self.assertIsNotNone(f.observe({'controller_stamp_unix_s': t,
+                                           'error_positions_rad': [e]*7}))

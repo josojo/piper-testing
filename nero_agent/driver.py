@@ -10,7 +10,7 @@ import math
 import time
 
 from .core import AgentError, JOINTS, MAX_EXCURSION_RAD, LARGE_EXCURSION_RAD, SEGMENT_EXCURSION_RAD
-from .core import FLOOR_EXCURSION_RAD, INTERIOR_ACCELERATION
+from .core import FLOOR_EXCURSION_RAD, INTERIOR_FIRMWARE_ACCELERATION
 from .stream_guard import StreamGuard
 from .controlled_abort import ControlledAbort
 
@@ -37,7 +37,7 @@ def main():
     from rclpy.node import Node
     from sensor_msgs.msg import JointState
     from control_msgs.msg import JointTrajectoryControllerState
-    from .tracking_diagnostic import ControllerTrace
+    from .tracking_diagnostic import ControllerTrace, TrackingMean
     from std_msgs.msg import Empty, String
     from std_srvs.srv import SetBool, Trigger
     from action_msgs.srv import CancelGoal
@@ -63,13 +63,14 @@ def main():
             self.velocity_trip_history = None
             self.tracking_diagnostic = None
             self.controller_trace = ControllerTrace()
+            self.tracking_mean = TrackingMean()
             self.cancel_client = self.create_client(CancelGoal, 'arm_controller/follow_joint_trajectory/_action/cancel_goal')
             self.abort = ControlledAbort(hardware, self.block_stream, self.cancel_controller)
             self.fault_pub = self.create_publisher(String, 'project/fault', 10)
-            self.publisher = self.create_publisher(JointState, 'feedback/joint_states', 10)
+            self.publisher = self.create_publisher(JointState, 'feedback/joint_states', 1)
             self.create_subscription(JointState, 'control/joint_commands', self.command, 1)
             self.create_subscription(JointTrajectoryControllerState, 'arm_controller/controller_state',
-                                     self.controller_trace.observe, 10)
+                                     self.controller_state, 10)
             self.create_subscription(Empty, 'project/heartbeat', self.heartbeat, 1)
             self.create_service(Trigger, 'project/commission_abort', self.commission_gate)
             if args.diagnose_feedback:
@@ -175,9 +176,8 @@ def main():
                     except Exception as stop_error:
                         self.fault += '; STOP DELIVERY FAILED: ' + str(stop_error)
                     self.get_logger().error(self.fault)
-                    # Stop first; diagnostics must not delay stop delivery.
-                    if hasattr(error, 'history'):
-                        self.get_logger().error('velocity_trip_history=' + json.dumps(error.history))
+                    # The timer still has to deliver the hold: defer trace
+                    # serialization to the full report after stop observation.
 
         def info(self, request, response):
             response.success = (self.last_state is not None and time.monotonic() - self.received < 0.25
@@ -332,7 +332,7 @@ def main():
                     fast_floor = args.floor_motion and not near_floor
                     self.hardware.stationary(require_enabled=True)
                     if fast_floor:
-                        self.hardware.configure_acceleration(INTERIOR_ACCELERATION, allow_increase=True)
+                        self.hardware.configure_acceleration(INTERIOR_FIRMWARE_ACCELERATION, allow_increase=True)
                     elif args.floor_motion:
                         self.hardware.configure_acceleration(.03)
                     else:
@@ -347,6 +347,7 @@ def main():
                                              LARGE_EXCURSION_RAD if args.large_motion else MAX_EXCURSION_RAD,
                                              command_velocity_limit=.25 if fast_floor else .10,
                                              position_velocity_limit=.50 if fast_floor else .15)
+                    self.tracking_mean = TrackingMean()
                     # Setup uses blocking SDK reads. Refresh publication before
                     # acknowledging the gate so clients do not inherit old state.
                     self.tick()
@@ -359,6 +360,22 @@ def main():
                 self.guard = None
                 response.success, response.message = False, str(error)
             return response
+
+        def controller_state(self, msg):
+            self.controller_trace.observe(msg)
+            if not self.guard or self.abort.phase != 'idle' or not self.controller_trace.samples:
+                return
+            row = self.controller_trace.samples[-1]
+            if not 0 <= time.time() - row['controller_stamp_unix_s'] <= .1:
+                return
+            reason = self.tracking_mean.observe(row)
+            if reason:
+                self.fault = reason
+                try:
+                    self.stop()
+                except Exception as error:
+                    self.fault += '; STOP DELIVERY FAILED: ' + str(error)
+                self.get_logger().error(self.fault)
 
         def command(self, msg):
             if args.diagnose_feedback or not self.guard or self.abort.phase != 'idle':
@@ -373,8 +390,14 @@ def main():
                 by_name = dict(zip(msg.name, msg.position))
                 q = [by_name[n] for n in JOINTS]
                 stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-                q = self.guard.command(q, self.last_state.joints_rad, stamp, time.time(), time.monotonic(),
-                                       position_timestamps=self.last_state.joint_position_timestamps)
+                try:
+                    q = self.guard.command(q, self.last_state.joints_rad, stamp, time.time(), time.monotonic(),
+                                           position_timestamps=self.last_state.joint_position_timestamps)
+                except AgentError as error:
+                    reason = self.controller_trace.hold_transition_reason(q, stamp)
+                    if reason:
+                        raise AgentError(reason + '; original guard rejection: ' + str(error)) from error
+                    raise
                 if self.trial:
                     self.trial.command(q, stamp, time.monotonic())
                 # The ROS2 joint_trajectory_controller supplies timed
