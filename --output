@@ -1,0 +1,2 @@
+Starting ROS stack; logs: reports/ros2-hardware-*.log
+ROS 2 + MoveIt ready (hardware, gripper modeled, arm-only commands).

@@ -78,7 +78,7 @@ MAX_FEEDBACK_AGE_S = 0.25
 MAX_FEEDBACK_SKEW_S = 0.15
 # Joint packets are read sequentially from the SDK. Keep a small allowance for
 # read/ROS scheduling jitter while retaining the tighter packet-skew check.
-MAX_JOINT_SNAPSHOT_AGE_S = 0.080
+MAX_JOINT_SNAPSHOT_AGE_S = 0.100
 MAX_JOINT_SNAPSHOT_SKEW_S = 0.020
 START_MATCH_RAD = 0.001
 SETTLE_TOLERANCE_RAD = 0.0005
@@ -107,9 +107,9 @@ class NeroHardware:
         self.robot = robot
         self.clock, self.wall_clock, self.sleep = clock, wall_clock, sleep
 
-    def configure_acceleration(self, maximum=MAX_CONTROLLER_ACCELERATION_RAD_S2, record=lambda event: None):
-        """Lower limits without motion; never restore higher limits automatically."""
-        maximum = min(maximum, MAX_CONTROLLER_ACCELERATION_RAD_S2)
+    def configure_acceleration(self, maximum=MAX_CONTROLLER_ACCELERATION_RAD_S2, record=lambda event: None, *, allow_increase=False):
+        """Set verified limits while stationary; raising requires explicit profile opt-in."""
+        maximum = min(maximum, .50 if allow_increase else MAX_CONTROLLER_ACCELERATION_RAD_S2)
         cap = acceleration_counts(maximum) / 100
         firmware = self.robot.get_firmware()
         if not isinstance(firmware, dict) or firmware.get("software_version") != "1.21":
@@ -117,7 +117,8 @@ class NeroHardware:
         self.stationary()
         # Read every original value before making any changes.
         original = [read_joint_acceleration(self.robot, j, self.wall_clock) for j in range(1, 8)]
-        targets = [acceleration_counts(min(value, cap)) / 100 for value in original]
+        targets = [acceleration_counts(cap if allow_increase else min(value, cap)) / 100
+                   for value in original]
         record({"event": "controller_acceleration_pending", "firmware": firmware,
                 "previous_rad_s2": original, "requested_rad_s2": targets,
                 "limits_retained_after_execution": True})

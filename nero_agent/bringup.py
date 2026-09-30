@@ -54,7 +54,7 @@ def main():
         if args.raw_can_output.suffix != '.jsonl':
             parser.error('--raw-can-output must use a new .jsonl file')
         protected = [args.config]
-        for option in ('--output', '--abort-qualification-report'):
+        for option in ('--output', '--abort-qualification-report', '--preview-output'):
             for index, value in enumerate(remaining):
                 if value == option and index+1 < len(remaining):
                     protected.append(Path(remaining[index+1]))
@@ -106,7 +106,8 @@ def main():
         if args.diagnose_feedback:
             commands[0].extend(['--diagnose-feedback', '--diagnostic-duration', str(diagnostic_args.duration)])
         if settings.mode == 'hardware' and settings.mujoco_preflight and not args.commission_abort:
-            commands[0].append('--segmented-motion' if settings.segmented_execution else '--large-motion')
+            commands[0].append('--floor-motion' if settings.floor_guard else
+                               '--segmented-motion' if settings.segmented_execution else '--large-motion')
         if args.commission_abort:
             if settings.mode != 'hardware':
                 raise RuntimeError('Commissioning requires hardware configuration')

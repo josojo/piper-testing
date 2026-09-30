@@ -379,7 +379,7 @@ class GuardTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, 'envelope: joint1'):
             guard.check_feedback([.311] + [0.] * 6, [0.] * 7, .04, .02)
         with self.assertRaisesRegex(AgentError, 'tracking bounds'):
-            guard.command([.20] + [0.] * 6, [.18] + [0.] * 6, 100., 100., .03)
+            guard.command([.20] + [0.] * 6, [.16] + [0.] * 6, 100., 100., .03)
 
     def test_velocity_trip_retains_offending_feedback_and_command(self):
         guard = StreamGuard([0.] * 7, .04, 0)
@@ -388,6 +388,8 @@ class GuardTests(unittest.TestCase):
         speeds[3] = -.125
         guard.check_feedback([0.] * 7, speeds, .04, .01,
                              velocity_timestamps=[99.94] * 7, wall_now=99.99)
+        guard.check_feedback([0.] * 7, speeds, .04, .015,
+                             velocity_timestamps=[99.945] * 7, wall_now=99.995)
         with self.assertRaisesRegex(AgentError, 'joint4 -0.125000') as raised:
             guard.check_feedback([0.] * 7, speeds, .04, .02,
                                  velocity_timestamps=[99.95] * 7, wall_now=100.)
@@ -449,21 +451,28 @@ class GuardTests(unittest.TestCase):
                                  .04, i * .01, velocity_timestamps=[100 + i * .01] * 7)
 
     def test_motor_filter_stops_sustained_or_alternating_overspeed(self):
-        for speeds in ((.16, .16), (.16, -.16), (.16, .01, .16)):
+        for speeds in ((.16, .16, .16), (.16, -.16, .16), (.16, .01, .16, .01, .16)):
             guard = StreamGuard([0.] * 7, .04, 0, motor_velocity_limit=.15)
             for i, speed in enumerate(speeds[:-1]):
                 guard.check_feedback([0.] * 7, [speed] * 7, .04, i * .01)
-            with self.assertRaisesRegex(AgentError, '3-sample median'):
+            with self.assertRaisesRegex(AgentError, '5-sample median'):
                 guard.check_feedback([0.] * 7, [speeds[-1]] * 7, .04, (len(speeds)-1) * .01)
 
     def test_motor_filter_does_not_recount_cache_or_reuse_old_spikes(self):
         guard = StreamGuard([0.] * 7, .04, 0, motor_velocity_limit=.15)
-        for now, stamp in ((0., 100.), (.01, 100.), (.02, 100.), (.04, 100.04)):
+        for now, stamp in ((0., 100.), (.01, 100.), (.02, 100.), (.06, 100.06), (.07, 100.07)):
             guard.check_feedback([0.] * 7, [.16] * 7, .04, now,
                                  velocity_timestamps=[stamp] * 7)
-        with self.assertRaisesRegex(AgentError, '3-sample median'):
-            guard.check_feedback([0.] * 7, [.16] * 7, .04, .05,
-                                 velocity_timestamps=[100.05] * 7)
+        with self.assertRaisesRegex(AgentError, '5-sample median'):
+            guard.check_feedback([0.] * 7, [.16] * 7, .04, .08,
+                                 velocity_timestamps=[100.08] * 7)
+
+    def test_five_sample_median_accepts_recorded_two_spike_pattern(self):
+        guard = StreamGuard([0.] * 7, .04, 0)
+        for i, speed in enumerate((-.027, -.026, -.133, -.011, -.116)):
+            guard.check_feedback([0.] * 7, [0., 0., 0., speed, 0., 0., 0.],
+                                 .04, i*.01, velocity_timestamps=[100+i*.01]*7)
+        self.assertAlmostEqual(guard.history[-1]['motor_median_speeds_rad_s'][3], .027)
 
     def test_motor_filter_hard_limit_is_immediate(self):
         guard = StreamGuard([0.] * 7, .04, 0, motor_velocity_limit=.15)
@@ -700,3 +709,45 @@ class RosExecutionTests(unittest.TestCase):
         b.executor.send_goal_async.assert_not_called()
         b._plan_from_state.assert_not_called()
         self.assertEqual(b.stop_calls, [True])
+
+    @patch('nero_agent.abort_policy.require_verified_controlled_abort')
+    def test_mujoco_setup_accepts_small_drift_without_replacing_checked_path(self, capability):
+        from dataclasses import replace
+        for joint_drift, gripper_drift, allowed in ((.000087, .00005, True),
+                                                    (.001, .000099, True),
+                                                    (.00101, 0., False),
+                                                    (0., .000101, False)):
+            with self.subTest(joint_drift=joint_drift, gripper_drift=gripper_drift):
+                b = self.backend()
+                b.settings = replace(b.settings, mujoco_preflight=True, floor_guard=True)
+                b.hardware, b.gate, b.floor_region = True, object(), object()
+                b.floor_regions = {'test': False}
+                original = b.plans['test'][0]
+                initial = b.state()
+                current = deepcopy(initial)
+                current['joints_rad'][0] += joint_drift
+                current['gripper_width_m'] += gripper_drift
+                states = iter([initial, current])
+                b.state = lambda: next(states)
+                b._call = lambda *a, **k: NS(success=True)
+                b._plan_from_state = MagicMock()
+                b.executor.send_goal_async = MagicMock()
+                b._wait = lambda *a, **k: NS(accepted=False)
+                expected = 'MoveIt rejected trajectory execution' if allowed else 'joint drift.*gripper drift'
+                with self.imports(), self.assertRaisesRegex(AgentError, expected):
+                    b.execute({'token': 'test'})
+                b._plan_from_state.assert_not_called()
+                if allowed:
+                    b.executor.send_goal_async.assert_called_once()
+                    self.assertIs(b.executor.send_goal_async.call_args.args[0].trajectory, original)
+                else:
+                    b.executor.send_goal_async.assert_not_called()
+
+    @patch('nero_agent.abort_policy.require_verified_controlled_abort')
+    def test_execution_reason_survives_stop_transport_failure(self, capability):
+        b = self.backend()
+        b._wait = lambda *a, **k: NS(accepted=False)
+        b.stop = MagicMock(side_effect=AgentError('ROS request timed out'))
+        with self.imports(), self.assertRaisesRegex(AgentError, 'MoveIt rejected trajectory execution') as raised:
+            b.execute({'token': 'test'})
+        self.assertEqual(raised.exception.stop_error, 'ROS request timed out')

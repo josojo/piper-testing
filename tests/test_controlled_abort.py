@@ -92,20 +92,20 @@ class AbortTests(unittest.TestCase):
             a = self.setup_abort(); a.tick()
             if excursion: self.q[1] = .03
             else: self.v[1] = .15
-            self.now = 5.1; a.tick()
+            self.now = 8.1; a.tick()
             self.assertEqual(a.phase, 'failed')
             self.hardware.robot.move_j.assert_called_once()
 
     def test_motion_resets_standstill_dwell(self):
         a = self.setup_abort(); a.tick()
         self.now = .1; a.tick()
-        self.v[0] = .02; self.now = .8; a.tick()
+        self.v[0] = .03; self.now = .8; a.tick()
         self.v[0] = 0.; self.now = 1.; a.tick()
         self.now = 1.2; a.tick()
         self.assertEqual(a.phase, 'settling')
         self.now = 2.1; a.tick()
         self.assertEqual(a.phase, 'holding')
-        self.v[0] = .02; self.now = 2.2; a.tick()
+        self.v[0] = .03; self.now = 2.2; a.tick()
         self.assertEqual(a.phase, 'rechecking')
         self.v[0] = 0.; self.now = 2.3; a.tick()
         self.now = 3.4; a.tick()
@@ -148,6 +148,55 @@ class AbortTests(unittest.TestCase):
         a.tick()
         self.assertEqual(a.phase, 'failed')
         self.assertEqual(a.result()['failure'], 'feedback lost')
+
+
+    def test_small_speed_reading_can_confirm_half_second_hold(self):
+        a = self.setup_abort(); a.tick()
+        self.v[0] = .015
+        for t in (.1, .4):
+            self.now = t; a.tick()
+            self.assertEqual(a.phase, 'settling')
+        self.now = .61; a.tick()
+        self.assertEqual(a.phase, 'holding')
+        self.assertAlmostEqual(a.result()['longest_stable_dwell_s'], .51)
+
+    def test_extended_settle_window_and_reset_diagnostics(self):
+        a = self.setup_abort(); a.tick()
+        for t, speed in ((.1, 0.), (.3, .03), (5.1, .03), (5.2, .015), (5.71, .015)):
+            self.now, self.v[0] = t, speed
+            a.tick()
+        self.assertEqual(a.phase, 'holding')
+        self.assertEqual(a.result()['speed_dwell_resets'], 1)
+        self.assertEqual(a.result()['position_dwell_resets'], 0)
+        self.hardware.robot.move_j.assert_called_once()
+
+    def test_persistent_speed_or_position_error_still_fails(self):
+        for position_error, speed in ((0., .021), (.006, 0.)):
+            a = self.setup_abort(); a.tick()
+            self.q[0], self.v[0] = position_error, speed
+            self.now = 8.1; a.tick()
+            self.assertEqual(a.phase, 'failed')
+            self.assertIn('within 8 seconds', a.result()['failure'])
+            self.assertIn('last speed', a.result()['failure'])
+            self.hardware.robot.move_j.assert_called_once()
+
+    def test_motor_feedback_age_accepts_84ms_but_rejects_over_100ms(self):
+        from tests.test_experiment import fake_hardware, DEMO_START
+        from nero_experiment.hardware import JointFeedbackTimingError
+        for age, allowed in ((.084, True), (.099, True), (.101, False)):
+            hardware = fake_hardware(DEMO_START)
+            get_motor = hardware.robot.get_motor_states
+            def motor(index):
+                packet = get_motor(index)
+                packet.timestamp -= age
+                return packet
+            hardware.robot.get_motor_states = motor
+            if allowed:
+                hardware.read(require_enabled=True)
+            else:
+                with self.assertRaisesRegex(JointFeedbackTimingError, 'limit 100 ms'):
+                    hardware.read(require_enabled=True)
+            self.assertFalse(hardware.robot.commands)
 
 
 class DriverAbortTests(unittest.TestCase):
@@ -193,6 +242,7 @@ class DriverAbortTests(unittest.TestCase):
             hardware.stop.assert_called_once()
         modules = {'rclpy': NS(init=lambda: None, spin=spin, ok=lambda: True, shutdown=lambda: None),
                    'rclpy.node': NS(Node=Node), 'sensor_msgs.msg': NS(JointState=NS),
+                   'control_msgs.msg': NS(JointTrajectoryControllerState=NS),
                    'std_msgs.msg': NS(Empty=NS, String=NS),
                    'std_srvs.srv': NS(SetBool=NS, Trigger=NS),
                    'action_msgs.srv': NS(CancelGoal=NS(Request=NS)),
@@ -252,6 +302,7 @@ class DriverAbortTests(unittest.TestCase):
             self.assertFalse(json.loads(reply.message)['motion_commands_sent'])
         modules = {'rclpy': NS(init=lambda: None, spin=spin, ok=lambda: True, shutdown=lambda: None),
                    'rclpy.node': NS(Node=Node), 'sensor_msgs.msg': NS(JointState=NS),
+                   'control_msgs.msg': NS(JointTrajectoryControllerState=NS),
                    'std_msgs.msg': NS(Empty=NS, String=NS),
                    'std_srvs.srv': NS(SetBool=NS, Trigger=NS),
                    'action_msgs.srv': NS(CancelGoal=NS(Request=NS)),
@@ -285,6 +336,47 @@ class BackendAbortTests(unittest.TestCase):
         self.assertEqual(result['status'], 'holding_observed')
         self.assertEqual(b.last_stop_result, {'status': 'holding'})
         self.assertFalse(b.motion_pending)
+
+    def test_request_timeout_is_warning_only_after_fresh_hold_confirmation(self):
+        import json
+        from unittest.mock import patch
+        from nero_agent.core import AgentError
+        from nero_agent.ros_backend import RosBackend
+        for state in ('holding', 'failed', 'unavailable'):
+            with self.subTest(state=state):
+                b = RosBackend.__new__(RosBackend)
+                b.hardware, b.motion_pending = True, True
+                b.source, b.pending_goal = 'hardware_feedback', None
+                b.estop, b.goal_handle = 'stop', NS(accepted=True, cancel_goal_async=lambda: object())
+                b._call = lambda *a, **k: NS(success=True)
+                b._wait = MagicMock(side_effect=AgentError('ROS request timed out'))
+                b._spin = lambda: None
+                def status():
+                    if state == 'unavailable':
+                        raise AgentError('No fresh stop status')
+                    return NS(success=True, message=json.dumps({'status': state, 'failure': 'still moving'}))
+                b.poll_abort_status = status
+                b.fetch_abort_report = lambda observed: observed
+                with patch.dict('sys.modules', {'std_srvs.srv': NS(Trigger=NS(Request=NS))}):
+                    if state == 'holding':
+                        result = b.stop()
+                        self.assertEqual(result['status'], 'holding_observed')
+                        self.assertIn('MoveIt cancellation request: ROS request timed out', result['transport_warnings'])
+                        self.assertFalse(b.motion_pending)
+                    else:
+                        with self.assertRaisesRegex(AgentError, 'Stop could not be confirmed'):
+                            b.stop()
+                        self.assertTrue(b.motion_pending)
+
+    def test_tracking_limit_allows_14_milliradians_but_rejects_over_15(self):
+        from nero_agent.stream_guard import StreamGuard
+        from nero_agent.core import AgentError, TRACKING_TOLERANCE_RAD
+        self.assertEqual(TRACKING_TOLERANCE_RAD, .015)
+        guard = StreamGuard([0.]*7, .04, 0)
+        guard.command([0.]*7, [0.]*7, 100., 100., 0.)
+        guard.command([.001]+[0.]*6, [-.013]+[0.]*6, 100.02, 100.02, .02)
+        with self.assertRaisesRegex(AgentError, 'tracking'):
+            guard.command([.002]+[0.]*6, [-.014]+[0.]*6, 100.04, 100.04, .04)
 
 
 class AbortReportingTests(unittest.TestCase):

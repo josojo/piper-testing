@@ -15,6 +15,7 @@ from moveit_configs_utils import MoveItConfigsBuilder
 # ros2 launch loads this file outside the project package search path.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nero_agent.tool_frame import xacro_mappings
+from nero_agent.core import TRACKING_TOLERANCE_RAD
 
 
 def build(context):
@@ -94,7 +95,7 @@ def build(context):
             'joints': joints, 'command_interfaces': ['position'], 'state_interfaces': ['position', 'velocity'],
             'open_loop_control': False, 'allow_partial_joints_goal': False,
             'constraints': {'goal_time': 3.0, 'stopped_velocity_tolerance': 0.01,
-                **{j: {'trajectory': 0.015, 'goal': 0.005} for j in joints}}}},
+                **{j: {'trajectory': TRACKING_TOLERANCE_RAD, 'goal': 0.005} for j in joints}}}},
     }
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
         yaml.safe_dump(controller_config, f)

@@ -1,26 +1,31 @@
 """Small bounds/watchdog guard for the ROS-to-NERO transport, not a planner."""
 import math
 from collections import deque
-from .core import AgentError, distance, vector, MAX_EXCURSION_RAD, excursion_detail
+from .core import AgentError, distance, vector, MAX_EXCURSION_RAD, excursion_detail, TRACKING_TOLERANCE_RAD
 
 
 class StreamGuard:
+    MOTOR_MEDIAN_SAMPLES = 5
+    MOTOR_MEDIAN_WINDOW_S = .050
     _POSITION_TIMESTAMP_INDEX = (0, 0, 1, 1, 2, 2, 3)
 
     def __init__(self, start, gripper, now, motor_velocity_limit=0.10,
-                 max_excursion=MAX_EXCURSION_RAD):
+                 max_excursion=MAX_EXCURSION_RAD, command_velocity_limit=.10,
+                 position_velocity_limit=.15):
         self.start = vector(start)
         self.gripper = gripper
         self.motor_velocity_limit = float(motor_velocity_limit)
         self.max_excursion = max_excursion
+        self.command_velocity_limit = command_velocity_limit
+        self.position_velocity_limit = position_velocity_limit
         self.last_command = None
         self.last_stamp = None
         self.command_at = now
         self.heartbeat_at = now
-        self.history = deque(maxlen=60)
+        self.history = deque(maxlen=400)
         self._last_feedback_joints = None
         self._last_position_timestamps = None
-        self._motor_samples = [deque(maxlen=3) for _ in range(7)]
+        self._motor_samples = [deque(maxlen=self.MOTOR_MEDIAN_SAMPLES) for _ in range(7)]
         self._motor_stamps = [None] * 7
 
     def check_feedback(self, joints, velocities, gripper, now,
@@ -58,20 +63,20 @@ class StreamGuard:
             if wall_now is not None:
                 event['motor_velocity_ages_s'] = tuple(wall_now - stamp for stamp in velocity_timestamps)
         self.history.append(event)
-        # Median absolute speed rejects one isolated outlier without allowing
-        # direction reversals to cancel. Two fresh high samples suffice, even
+        # Median absolute speed rejects up to two isolated outliers without allowing
+        # direction reversals to cancel. Three fresh high samples suffice, even
         # during startup. Never count repeated SDK cache reads as new evidence.
         filtered = []
         for i, speed in enumerate(velocity):
             samples = self._motor_samples[i]
-            while samples and now - samples[0][0] > 0.030:
+            while samples and now - samples[0][0] > self.MOTOR_MEDIAN_WINDOW_S:
                 samples.popleft()
             stamp = now if velocity_timestamps is None else velocity_timestamps[i]
             if self._motor_stamps[i] is None or stamp > self._motor_stamps[i]:
                 samples.append((now, abs(speed)))
                 self._motor_stamps[i] = stamp
-            values = sorted([value for _, value in samples] + [0.] * (3 - len(samples)))
-            filtered.append(values[1])
+            values = sorted([value for _, value in samples] + [0.] * (self.MOTOR_MEDIAN_SAMPLES - len(samples)))
+            filtered.append(values[self.MOTOR_MEDIAN_SAMPLES // 2])
         event['motor_median_speeds_rad_s'] = tuple(filtered)
         raw_index = max(range(7), key=lambda i: abs(velocity[i]))
         immediate = abs(velocity[raw_index]) > 2 * self.motor_velocity_limit
@@ -83,7 +88,7 @@ class StreamGuard:
                     'joint%d=%.1fms' % (i + 1, age * 1000)
                     for i, age in enumerate(event['motor_velocity_ages_s']))
             basis = ('instantaneous hard limit %.3f rad/s' % (2 * self.motor_velocity_limit)
-                     if immediate else '3-sample median speed %.6f rad/s' % filtered[index])
+                     if immediate else '%d-sample median speed %.6f rad/s' % (self.MOTOR_MEDIAN_SAMPLES, filtered[index]))
             error = AgentError('Measured velocity exceeded %.3f rad/s: joint%d %.6f rad/s; '
                                'measured %.6f rad, last command %s%s' %
                                (self.motor_velocity_limit, index + 1, velocity[index], q[index],
@@ -95,10 +100,10 @@ class StreamGuard:
         if derived is not None:
             derived_index = max((i for i, value in enumerate(derived) if value is not None),
                                 key=lambda i: abs(derived[i]), default=None)
-            if derived_index is not None and abs(derived[derived_index]) > 0.15:
-                error = AgentError('Position-derived velocity exceeded 0.150 rad/s: joint%d %.6f rad/s; '
+            if derived_index is not None and abs(derived[derived_index]) > self.position_velocity_limit:
+                error = AgentError('Position-derived velocity exceeded %.3f rad/s: joint%d %.6f rad/s; '
                                    'measured %.6f rad' %
-                                   (derived_index + 1, derived[derived_index], q[derived_index]))
+                                   (self.position_velocity_limit, derived_index + 1, derived[derived_index], q[derived_index]))
                 error.history = list(self.history)
                 raise error
         if distance(joints, self.start) > self.max_excursion + 0.01:
@@ -109,24 +114,36 @@ class StreamGuard:
         if now - self.command_at > 0.25 or now - self.heartbeat_at > 0.5:
             raise AgentError('Controller stream or application heartbeat timed out')
 
-    def command(self, joints, measured, stamp, wall_now, now):
+    def command(self, joints, measured, stamp, wall_now, now, position_timestamps=None):
         q = vector(joints)
-        self.history.append({'event': 'command_received', 'monotonic_s': now,
-                             'stamp': stamp, 'joints_rad': q,
-                             'measured_rad': vector(measured)})
+        measured = vector(measured)
+        event = {'event': 'command_received', 'monotonic_s': now,
+                 'received_unix_s': wall_now, 'stamp': stamp, 'joints_rad': q,
+                 'measured_rad': measured, 'position_error_rad': tuple(a-b for a, b in zip(q, measured)),
+                 'previous_command_rad': self.last_command, 'previous_command_stamp': self.last_stamp,
+                 'tracking_limit_rad': TRACKING_TOLERANCE_RAD,
+                 'command_velocity_limit_rad_s': self.command_velocity_limit}
+        if position_timestamps is not None:
+            event['joint_position_timestamps'] = tuple(position_timestamps)
+        self.history.append(event)
         if not math.isfinite(stamp) or not 0 <= wall_now - stamp <= 0.1:
             raise AgentError('Controller command timestamp is stale or invalid')
         if distance(q, self.start) > self.max_excursion + 1e-6:
             raise AgentError('Controller command exceeded excursion bounds: ' +
                              excursion_detail(q, self.start, self.max_excursion))
-        if distance(q, measured) > 0.015:
+        if distance(q, measured) > TRACKING_TOLERANCE_RAD:
             raise AgentError('Controller command exceeded excursion/tracking bounds')
         if self.last_command is None:
             if distance(q, measured) > 0.005:
                 raise AgentError('Controller initial position does not match measured arm')
         else:
             dt = stamp - self.last_stamp
-            if dt <= 0 or distance(q, self.last_command) > 0.10 * max(dt, 0.01) + 1e-5:
-                raise AgentError('Controller command stream exceeded velocity limit')
+            delta = distance(q, self.last_command)
+            allowance = self.command_velocity_limit * max(dt, 0.01) + 1e-5
+            event.update(command_dt_s=dt, max_command_delta_rad=delta, allowed_command_delta_rad=allowance)
+            if dt <= 0 or delta > allowance:
+                raise AgentError('Controller command stream exceeded velocity limit: '
+                                 'dt %.9f s, largest step %.9f rad, allowed %.9f rad; limit %.3f rad/s' %
+                                 (dt, delta, allowance, self.command_velocity_limit))
         self.last_command, self.last_stamp, self.command_at = q, stamp, now
         return q

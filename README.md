@@ -231,7 +231,7 @@ Each physical motion requires typing `EXECUTE`. Start with the deterministic tes
 
 MoveIt planning targets 0.08 rad/s velocity and 0.135 rad/s² acceleration (global scaling factors of 1.0 and 0.90), subject to any lower configured limits. Acceleration planning leaves margin below the 0.15 rad/s² preflight cap. With MuJoCo preflight enabled, a timing pass also bounds the controller’s quintic velocity and acceleration between waypoints and uniformly slows trajectories when needed, scaling waypoint derivatives consistently. The resulting trajectory must pass timing, excursion, and clearance validation; reports include the interpolation time scale and original derivative bounds. Plans and streamed commands allow a 0.30 rad (about 17°) maximum per-joint excursion from their captured start; measured feedback has an additional 0.01 rad margin. Trajectory excursion rejections report the joint with the largest displacement, its start and planned position, excess over the limit, and trajectory time. Accepted plan summaries include peak excursion. The execution timeout remains 30 seconds; commissioning retains its tighter limits. This allowance does not guarantee that a Cartesian photo target is reachable within the envelope.
 
-MoveIt sends the timed trajectory to the ROS2 `joint_trajectory_controller`; the hardware bridge forwards controller position targets through the vendor's ordinary `move_j` position interface. The unsmoothed instantaneous SDK `move_js` interface is not used for trajectory execution. The bridge retains the default 0.10 rad/s motor-feedback guard (optionally raised with `--motor-velocity-limit` up to 0.15 rad/s), using the median of the last three fresh absolute-speed samples within 30 ms (two over-limit samples trip, including at startup; repeated cached packets do not count). A raw sample above twice the configured motor limit still trips immediately. This filter typically adds one 10 ms polling interval to sustained-overspeed detection and is not hardware-qualified. The bridge also retains an independent 0.15 rad/s position-derived velocity check, fresh-feedback checks, tracking bounds, and a command/heartbeat watchdog. It reuses the pinned SDK and firmware-specific acceleration encoding/readback correction. These checks can reject a trajectory; they do not establish physical tracking performance in advance.
+MoveIt sends the timed trajectory to the ROS2 `joint_trajectory_controller`; the hardware bridge forwards controller position targets through the vendor's ordinary `move_j` position interface. The unsmoothed instantaneous SDK `move_js` interface is not used for trajectory execution. The bridge retains the default 0.10 rad/s motor-feedback guard (optionally raised with `--motor-velocity-limit` up to 0.15 rad/s), using the median of the last five fresh absolute-speed samples within 50 ms (three over-limit samples trip, including at startup; repeated cached packets do not count). A raw sample above twice the configured motor limit still trips immediately. This filter typically adds two 10 ms polling intervals to sustained-overspeed detection and is not hardware-qualified. The bridge also retains an independent 0.15 rad/s position-derived velocity check, fresh-feedback checks, tracking bounds, and a command/heartbeat watchdog. It reuses the pinned SDK and firmware-specific acceleration encoding/readback correction. These checks can reject a trajectory; they do not establish physical tracking performance in advance.
 
 After a moving-abort qualification passes, supply that report explicitly for hardware execution:
 
@@ -242,7 +242,88 @@ planning and driver excursion limits to 1.20 rad per joint (measured feedback:
 tighter limits. Speed, acceleration, watchdog and controlled-abort checks do not
 increase.
 
-The local hardware configuration now selects `"motion_profile": "mujoco_segmented"`.
+The local hardware configuration selects `"motion_profile": "mujoco_floor"`.
+This executes one continuous controller trajectory, without the forced 0.09-rad
+stop-and-settle legs. Interior caps are **0.20 rad/s and 0.50 rad/s²**. A uniform
+retiming of the MoveIt curve preserves its path while allowing it to run faster
+than MoveIt's conservative initial timing. The captured-start allowance is
+2π rad per joint; loaded absolute joint limits still apply. The timeout is 600 s.
+
+The workspace is the infinite half-space **base_link z ≥ -0.04 m**, with no x/y
+boundary. Preflight checks every padded arm and gripper collision box against
+that lower boundary, including between controller waypoints and a 0.015-rad joint tracking
+allowance. Only the fixed mounting base is exempt. The certified lowest z coordinate must be at least -0.04 m; collision-box
+padding and the tracking allowance still apply. If any part of the checked route comes within a
+**4 cm floor band (z below 0 m)**, the whole trajectory is retimed to **0.02 rad/s and
+0.03 rad/s²**, still without intermediate stops. This deliberately slows the
+whole route instead of introducing local speed transitions.
+
+Bringup automatically selects `--floor-motion`. Before each execution, the backend
+sends the checked speed region to the disarmed driver. Interior motion uses
+0.25 rad/s command-stream, 0.30 rad/s motor-feedback and 0.50 rad/s
+position-derived velocity trip limits. Near-floor
+motion retains the old stream/feedback limits and lowers firmware acceleration
+to 0.03 rad/s². Interior execution explicitly raises and verifies the firmware
+acceleration cap to 0.50 rad/s² while stationary; these settings remain afterward.
+Restart the running stack after changing profiles. Existing heartbeat, tracking,
+fresh-feedback, scene-change, controlled-abort and self-collision checks remain.
+MuJoCo validation is adaptive, with more subdivision near geometric boundaries;
+validation subdivisions do not cause physical stops. Unrepresented scene objects
+and attachments are rejected. The existing structural self-collision exclusions
+still apply: this is a modeled path check, not a guarantee of hardware stopping
+distance or complete self-collision coverage. No hardware motion is needed to run
+`.venv/bin/python -m unittest tests.test_floor_motion`.
+
+To inspect the actual candidate path in MuJoCo, export it during a planning-only
+run (the preview is saved even when geometric validation rejects the candidate):
+
+```bash
+sudo ./scripts/nero_ros2.sh hardware nero-agent.local.json \
+  --start-pose zero_pose \
+  --preview-output reports/zero-pose-preview.json \
+  --output reports/zero-pose-plan.json
+.venv/bin/python -m nero_agent.preview reports/zero-pose-preview.json
+```
+
+The viewer runs on the host desktop without ROS, CAN, or hardware commands. It
+starts paused: **Space** plays/pauses at ¼ speed, **left/right arrows** scrub by
+50 ms, **R** resets, **B** toggles the padded collision boxes, and **J** jumps to
+the rejected time interval when present in the diagnostic. Red highlights the
+reported geometry pair; yellow traces the gripper-base center. The original
+rejection text is printed in the terminal. The viewer shows nominal poses and
+padded boxes, not a swept tracking-error envelope; apparent visual separation
+alone does not certify clearance. It can display rejected candidates, so viewing
+never authorizes execution. Keep the generated asset folder beside the preview
+JSON if moving it to another machine. `--check` loads/samples without a display;
+`--speed 0.1` changes playback speed. Export currently supports continuous
+MuJoCo profiles only. Earlier summary reports lack the trajectory and cannot be
+replayed exactly; rerun planning with `--preview-output`. No image rebuild is
+needed for this repository code change.
+
+For browser playback on a headless machine, install and launch Viser:
+
+```bash
+.venv/bin/pip install -r requirements-viewer.txt
+.venv/bin/python -m nero_agent.viser_preview reports/zero-pose-preview.json
+```
+
+Open `http://localhost:8080`. If the viewer runs on another Ubuntu, run
+`ssh -N -L 8080:127.0.0.1:8080 user@ubuntu-machine` on the computer with your
+browser first (or forward port 8080 in VS Code). The viewer binds to localhost
+and starts paused. Use Play, Time, Speed, and the collision-box checkbox;
+drag the camera to inspect other angles. Rejected candidates retain their
+diagnostic and offer a jump to the rejected interval. The yellow trace is the
+gripper-base center, not the TCP. The display uses the exported collision meshes.
+MuJoCo computes poses only; rendering happens in your browser, without a server
+desktop or OpenGL renderer. No ROS or hardware connection is created.
+
+To run the viewer locally with files from another Ubuntu, copy both the preview
+JSON and the asset directory named by its `model_file`, keeping their relative
+paths. A summary such as `zero-pose-plan.json` is insufficient: use the separate
+`--preview-output` export above. Existing summaries cannot reconstruct the path.
+The export's continuous-profile limitation also applies to browser playback.
+
+The legacy `"motion_profile": "mujoco_segmented"` remains available.
 This uses a separate overall allowance of 3.14 rad per joint from the original
 captured start, the loaded model's absolute joint limits, and a 600-second route
 budget. It does not reset the overall reference at each step. After checking the
@@ -266,7 +347,7 @@ into `base_link` using fixed transforms from the loaded URDF. Unknown or moving
 frames are rejected; `world` is not assumed identical to `base_link`. MuJoCo
 places the configured obstacle boxes using that same fixed base transform.
 
-Every plan in either MuJoCo profile must pass `nero_agent/mujoco_preflight.py` before it
+Every plan in a MuJoCo profile must pass `nero_agent/mujoco_preflight.py` before it
 can be offered for execution. It imports MoveIt's loaded URDF collision meshes
 into MuJoCo, uses the measured gripper width and the configuration's collision
 boxes, and reuses the existing named structural-body exclusions. Meshes receive
@@ -285,11 +366,18 @@ rejects and asks for a new plan instead of silently replanning while armed.
 Start with a planning-only invocation (omit `--execute`). No Docker rebuild is
 needed with the existing image's MuJoCo dependency.
 
+Normal controlled-abort observation allows 8 seconds to establish a continuous
+0.5-second dwell with reported speed at most 0.02 rad/s and position error at
+most 0.005 rad. The hard hold-excursion limit remains 0.02 rad. Reports include
+speed/position dwell-reset counts and the longest observed stable dwell.
+Moving-abort commissioning retains its stricter 5-second timeout, 2-second dwell,
+0.003 rad/s speed, 0.002 rad position tolerance and 0.01 rad excursion bounds.
+
 After a controlled abort has reached verified `holding`, a speed/position
 disturbance within the hard hold-excursion bound changes the status to
 `rechecking`. The existing hold target is retained and execution stays latched
 off; no additional motion command is sent. A fresh uninterrupted hold dwell
-(normally one second) must complete within five seconds of the disturbance.
+(normally 0.5 seconds at no more than 0.02 rad/s) must complete within five seconds of the disturbance.
 Further spikes reset the dwell but never extend that recovery deadline.
 Stale/disabled feedback and excess hold excursion still fail immediately.
 The client bounds its total stop-observation wait to 12 seconds. Reports expose
@@ -701,7 +789,7 @@ The operator must type `EXECUTE` after successful simulation and preflight. Any 
 | Position tolerance for settling | 0.0005 rad for at least 0.3 s |
 | Certified tracking envelope | Endpoint joint bounds expanded by 0.002 rad |
 | Required collision clearance | 0.005 m throughout each checked envelope |
-| Joint packet age / inter-packet skew | At most 80 ms / 20 ms |
+| Joint packet age / inter-packet skew | At most 100 ms / 20 ms |
 | Other feedback packet age / overall skew | At most 250 ms / 150 ms |
 | Motor velocity trip threshold | 0.10 rad/s; joint finite-difference cross-check at 0.11 rad/s |
 | Polling period | 20 ms, subject to OS and SDK scheduling |
@@ -709,10 +797,86 @@ The operator must type `EXECUTE` after successful simulation and preflight. Any 
 
 The three-request default reduces LLM cost by choosing larger prevalidated waypoints. It does not raise the simulated speed or acceleration limits: those remain 0.08 rad/s and 0.15 rad/s². `move_j` performs controller-side interpolation, not the exact quintic timing seen in simulation. The adapter splits each waypoint into at most 0.002 rad joint microsteps, uses a 1% controller speed setting, and settles each command from measured feedback. It certifies a whole joint-angle box for each microstep, including a tracking margin: every combination of joint positions within that box has the required modeled clearance. This accounts for differing joint timing. The upright experiment uses a 5 mm minimum clearance so closer modeled link pairs can pass; this is a small model-based margin and can still be less than the collision-proxy model error. Review the geometry against the real setup before any physical execution. Conservative geometry-motion bounds can still reject a move even when a line-path simulation passes. A run may reject the three-waypoint plan if any large segment cannot be certified within the configured joint, translation, clearance or duration limits.
 
-The monitor checks fresh joint, motor, driver and arm-status feedback; bounds joint position and measured speed; and waits for measured arrival, not just an idle flag. Before a command, joint age/skew failures reset the settling dwell and are resampled within the existing 5-second stationary timeout. Every accepted joint and motor-velocity snapshot must meet the 80 ms age / 20 ms skew limits. The age allowance accommodates sequential SDK reads and scheduling delays; samples older than 80 ms are rejected. During an active move, timing failures still abort immediately. Timing errors include individual packet ages and skew; controller/driver faults are not retried by the stationary check. Execution report updates reuse serialized trajectories to reduce interference with the SDK receiver thread. A fault, timeout, stale packet, tracking deviation or Ctrl-C during execution triggers a best-effort electronic stop and cancels the remaining outward/return commands. Reports record the measured state and goal before each command and the achieved state after settling; an aborted report explicitly indicates that physical motion may have occurred. A motor or finite-difference velocity trip also records a `velocity_limit_exceeded` event with the source, joint, threshold, goal, elapsed command time, and up to 26 recent feedback snapshots (roughly 0.5 seconds at nominal polling, including the offending sample). Snapshots contain joint positions, motor velocities and packet timestamps. The buffer stays in memory during motion; serialization and report writing happen only after the electronic stop has been attempted, including when stop delivery fails. Diagnostic report failures do not replace the original motion/stop error.
+The monitor checks fresh joint, motor, driver and arm-status feedback; bounds joint position and measured speed; and waits for measured arrival, not just an idle flag. Before a command, joint age/skew failures reset the settling dwell and are resampled within the existing 5-second stationary timeout. Every accepted joint and motor-velocity snapshot must meet the 100 ms age / 20 ms skew limits. The age allowance accommodates sequential SDK reads and scheduling delays; samples older than 100 ms are rejected. During an active move, timing failures still abort immediately. Timing errors include individual packet ages and skew; controller/driver faults are not retried by the stationary check. Execution report updates reuse serialized trajectories to reduce interference with the SDK receiver thread. A fault, timeout, stale packet, tracking deviation or Ctrl-C during execution triggers a best-effort electronic stop and cancels the remaining outward/return commands. Reports record the measured state and goal before each command and the achieved state after settling; an aborted report explicitly indicates that physical motion may have occurred. A motor or finite-difference velocity trip also records a `velocity_limit_exceeded` event with the source, joint, threshold, goal, elapsed command time, and up to 26 recent feedback snapshots (roughly 0.5 seconds at nominal polling, including the offending sample). Snapshots contain joint positions, motor velocities and packet timestamps. The buffer stays in memory during motion; serialization and report writing happen only after the electronic stop has been attempted, including when stop delivery fails. Diagnostic report failures do not replace the original motion/stop error.
 
 This Python process is not a real-time safety controller. Polling can miss between-sample deviations, CAN/software stops can fail, and process termination or power loss can prevent cleanup. The simulator does not validate real acceleration, stopping distance, payload dynamics or controller tracking. Full extension can be singular; a controller singularity status aborts the experiment rather than forcing the last move. Physical validation, refined collision exclusions and an independent stop remain necessary. Automated motion tests use fake feedback. The corrected acceleration setup has also been checked on a physical NERO 1.21 without sending motion commands; all seven joints read back 0.15 rad/s² (see `reports/acceleration-setup-verified-20260916.json`). This does not validate trajectory tracking during physical execution.
 
 The 0.002 rad microsteps may reduce transient motion peaks but do not enforce acceleration or guarantee compliance with the velocity trip threshold. They increase the command count and execution time; the 2,000-command and 1,200-second limits remain in force. The SDK accepts integer speed percentages, so a fractional ramp between 0% and 1% is unavailable. After EXECUTE confirmation, the experiment lowers controller joint acceleration limits to at most 0.15 rad/s² (or the lower simulated limit), preserves existing stricter limits, and requires fresh readback for all seven joints before any movement. Missing, stale, mismatched or invalid readback aborts execution. The reduced limits remain configured after success or failure; the experiment never automatically restores higher acceleration. This supplies a controller acceleration cap, not a continuous trajectory or a jerk limit. The velocity trip thresholds remain unchanged.
 
 The project-local `nero_experiment/sdk_compat.py` repairs the acceleration write path for NERO firmware 1.21 and the pyAgxArm revision pinned in `requirements-hardware.txt`. NERO 1.21 uses different write and feedback units: 0.01 rad/s² for CAN 0x475 writes and 0.001 rad/s² for 0x47C feedback. The upstream setter incorrectly scales writes by 10,000 instead of 100; the compatibility path encodes 0.15 rad/s² as raw 15 and waits up to one second for matching fresh readback. Configuration can take effect after the first query. A missing response can consume the one-second query timeout. Zero-calibration and fault-clearing fields stay disabled. This avoids modifying installed site-packages; calls to the upstream setter outside this adapter are not patched. Other SDK revisions or firmware versions require review. Execution reports retain the original, requested and verified limits, including completed changes if a later joint fails.
+
+
+For continuous MuJoCo profiles, the final setup comparison accepts up to
+0.001 rad (0.057°) per joint and 0.0001 m (0.1 mm) of gripper-opening drift.
+Execution keeps the original checked trajectory; it does not replan while armed.
+The joint drift fits inside the existing 0.015-rad tracking envelope. Collision
+and floor geometry additionally cover 1.1 mm of gripper-opening variation:
+0.1 mm setup drift plus the driver's 1 mm in-flight tolerance. Larger setup
+changes reject with the measured deltas and thresholds. Segmented setup limits
+remain unchanged.
+
+
+The controller path-error limit, bridge command tracking limit, and MuJoCo joint
+tracking allowance share `TRACKING_TOLERANCE_RAD = 0.015`. Goal and setup tolerances
+are separate and unchanged. A larger tracking allowance permits more execution
+error but makes geometric preflight more conservative, so previously accepted
+paths may require replanning. A freshly observed powered hold is reported as
+`stop_status: holding_observed`; earlier stop/cancellation request timeouts appear
+in `stop_warnings`. The original execution failure remains the primary `reason`.
+Without a confirmed hold, stop failures remain errors.
+
+### Enter a new target in Viser
+
+Enable XYZ and quaternion entry against an **already running**, stationary ROS
+stack (the viewer does not launch another hardware bridge):
+
+```bash
+.venv/bin/python -m nero_agent.viser_preview reports/zero-pose-preview.json \
+  --planning-config nero-agent.local.json --ros-container CONTAINER_ID \
+  --host 192.168.178.124 --port 8080
+```
+
+The viewer process needs Docker access. Omit `--ros-container` when running in
+a Python environment with ROS sourced and access to the existing stack.
+Press **Calculate trajectory** to plan the gripping TCP destination in
+`base_link` meters, with a fixed X/Y/Z/W unit quaternion. Initial fields use
+one configured Cartesian pose, or a generic editable target if none exists;
+they do not represent current measured TCP coordinates. Planning starts from
+fresh feedback, not the playback cursor. Keep the robot stationary while planning.
+Existing MoveIt and continuous MuJoCo validation applies without changing limits.
+Each request saves its configuration, log and available preview in a unique
+`reports/viewer-plan-*` directory. Successful candidate generation replaces the
+playback; rejected exported candidates display their rejection status/reason.
+Failures without a candidate leave the previous trajectory visible and report
+an error. The browser has no execute button and sends no motion commands.
+
+Viser watches the selected **Preview file** every second by default. Re-running
+planning with the same `--preview-output` path automatically loads the replacement
+and resets playback to the beginning, paused. **Displayed file** and **Loaded at**
+identify what is currently on screen. To open another export, enter its path in
+**Preview file** and click **Load / reload file**. Relative paths are resolved
+from the viewer process's working directory. Use the preview JSON, not the plan
+summary JSON. Disable **Auto-reload selected file** to keep inspecting the current
+revision; manual reload still works. Unreadable or incomplete replacements show
+an error and keep the previous trajectory visible. Preview exports are published
+atomically after their model assets are ready. Only the selected file is watched;
+the viewer does not guess which unrelated file in `reports/` is newest.
+
+
+Tracking-failure diagnostics are saved under
+`controlled_abort.tracking_diagnostic` in execution reports. The driver freezes
+up to 400 interleaved command/feedback events when it blocks the stream, plus
+up to 400 controller-state messages. Command events include their ROS stamp,
+receive time, the exact measured positions used by the check, original grouped
+hardware position timestamps, signed tracking errors, and command-step limits.
+Controller samples include desired/actual/error positions and velocities,
+controller timestamps and receive times, reordered into joint1–joint7 order.
+The controller's timestamp is not the hardware sample timestamp; use the bridge
+packet timestamps to investigate feedback latency. Controller data comes from
+[the controller_state topic](https://control.ros.org/humble/doc/ros2_controllers/joint_trajectory_controller/doc/userdoc.html#publishers).
+
+Capture is bounded in memory and exported only in the full stop report, not live
+status polling. Invalid diagnostic messages are counted and discarded. Missing
+controller samples are visible as an empty sample list. No tracking-error filter
+or tolerance change is applied; the 0.015-rad instantaneous bound remains in force.
+The same execution command enables capture automatically, with no image rebuild.

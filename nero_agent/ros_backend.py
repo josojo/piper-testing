@@ -59,6 +59,7 @@ class RosBackend:
         self.sample_error = None
         self.driver_fault = None
         self.plans = {}
+        self.floor_regions = {}
         self.heartbeat_at = 0.0
         self.initial = None
         self.scene_applied = False
@@ -77,6 +78,7 @@ class RosBackend:
             self.subscription = self.node.create_subscription(JointState, topic, self._sample, 10)
             self.info = self.node.create_client(Trigger, ns + '/project/info')
             self.gate = self.node.create_client(SetBool, ns + '/project/control_enable')
+            self.floor_region = self.node.create_client(SetBool, ns + '/project/floor_near')
             self.estop = self.node.create_client(Trigger, ns + '/project/stop')
             self.abort_status = self.node.create_client(Trigger, ns + '/project/abort_status')
             self.abort_report = self.node.create_client(Trigger, ns + '/project/abort_report')
@@ -198,10 +200,10 @@ class RosBackend:
         req = GetPlanningScene.Request()
         req.components.components = (C.WORLD_OBJECT_GEOMETRY | C.WORLD_OBJECT_NAMES |
                                      C.ALLOWED_COLLISION_MATRIX | C.ROBOT_STATE_ATTACHED_OBJECTS)
-        if self.settings.segmented_execution:
+        if self.settings.mujoco_preflight:
             req.components.components |= C.OCTOMAP
         scene = self._call(self.scene, req).scene
-        if self.settings.segmented_execution:
+        if self.settings.mujoco_preflight:
             from .segmented import require_supported_scene
             require_supported_scene(scene, self.settings.collision_boxes, self.preflight_description)
         payload = [message_to_ordereddict(scene.world), message_to_ordereddict(scene.allowed_collision_matrix),
@@ -220,6 +222,8 @@ class RosBackend:
             summary.update(segment_summary)
         token = uuid.uuid4().hex
         self.plans[token] = (trajectory, before, goal, digest)
+        if self.settings.floor_guard:
+            self.floor_regions[token] = summary['mujoco_preflight']['speed_region'] == 'near_floor'
         return {'token': token, 'backend': 'moveit2', 'collision_checked': True,
                 'start': before['joints_rad'], 'goal': list(goal), **summary}
 
@@ -277,22 +281,57 @@ class RosBackend:
                                       self.initial, self.settings)
         if self.settings.mujoco_preflight:
             from .mujoco_preflight import retime_interpolation
-            timing = retime_interpolation(trajectory.joint_trajectory, self.settings)
+            timing = retime_interpolation(trajectory.joint_trajectory, self.settings,
+                                          allow_speedup=self.settings.floor_guard)
             summary = validate_trajectory(trajectory.joint_trajectory, before_joints, goal,
                                           self.initial, self.settings)
             summary.update(timing)
         summary.update(self._mujoco_preflight(description, trajectory, before))
+        summary.update(validate_trajectory(trajectory.joint_trajectory, before_joints, goal,
+                                           self.initial, self.settings))
         return trajectory, digest, summary, goal
 
     def _mujoco_preflight(self, description, trajectory, before):
+        path = getattr(self, 'preview_output', None)
+        if path is None:
+            return self._check_mujoco_preflight(description, trajectory, before)
+        from .preview import export_preview
+        try:
+            result = self._check_mujoco_preflight(description, trajectory, before)
+        except AgentError as error:
+            try:
+                export_preview(path, description, trajectory.joint_trajectory, before,
+                               self.settings, 'rejected', str(error))
+            except Exception as export_error:
+                raise AgentError('%s; preview export failed: %s' % (error, export_error)) from error
+            raise
+        export_preview(path, description, trajectory.joint_trajectory, before,
+                       self.settings, 'passed_geometric_preflight')
+        return result
+
+    def _check_mujoco_preflight(self, description, trajectory, before):
         if not self.settings.mujoco_preflight:
             return {}
         try:
             from .mujoco_preflight import validate
         except ImportError as error:
             raise AgentError('Large motion requires MuJoCo preflight: ' + str(error)) from error
-        return {'mujoco_preflight': validate(description, trajectory.joint_trajectory,
-                                             before, self.initial, self.settings)}
+        result = validate(description, trajectory.joint_trajectory,
+                          before, self.initial, self.settings)
+        if self.settings.floor_guard:
+            from dataclasses import replace
+            from .core import FLOOR_SLOW_BAND_M, FLOOR_MIN_Z_M
+            from .mujoco_preflight import retime_interpolation
+            near_floor = result['minimum_floor_clearance_bound_m'] < FLOOR_MIN_Z_M + FLOOR_SLOW_BAND_M
+            if near_floor:
+                limits = replace(self.settings, max_velocity=.02, max_acceleration=.03)
+                retime_interpolation(trajectory.joint_trajectory, limits)
+                result = validate(description, trajectory.joint_trajectory, before, self.initial, limits)
+            result['speed_region'] = 'near_floor' if near_floor else 'interior'
+            result['velocity_limit_rad_s'] = .02 if near_floor else self.settings.max_velocity
+            result['acceleration_limit_rad_s2'] = .03 if near_floor else self.settings.max_acceleration
+            result['execution_mode'] = 'continuous'
+        return {'mujoco_preflight': result}
 
     def _prepare_segments(self, trajectory, before):
         from .segmented import SegmentedRoute, make_segments, STOP_DWELL
@@ -421,11 +460,14 @@ class RosBackend:
                                       self.initial, self.settings)
         if self.settings.mujoco_preflight:
             from .mujoco_preflight import retime_interpolation
-            timing = retime_interpolation(trajectory.joint_trajectory, self.settings)
+            timing = retime_interpolation(trajectory.joint_trajectory, self.settings,
+                                          allow_speedup=self.settings.floor_guard)
             summary = validate_trajectory(trajectory.joint_trajectory, before_joints, goal,
                                           self.initial, self.settings)
             summary.update(timing)
         summary.update(self._mujoco_preflight(description, trajectory, before))
+        summary.update(validate_trajectory(trajectory.joint_trajectory, before_joints, goal,
+                                           self.initial, self.settings))
         return trajectory, digest, summary
 
     def execute(self, plan):
@@ -440,6 +482,11 @@ class RosBackend:
         if saved is None:
             raise AgentError('Unknown or already executed plan')
         trajectory, before, goal, digest = saved
+        near_floor = None
+        if self.settings.floor_guard:
+            near_floor = self.floor_regions.pop(plan['token'], None)
+            if near_floor is None:
+                raise AgentError('Missing checked floor speed region; re-plan')
         from .segmented import SegmentedRoute, SETUP_DRIFT, STOPPED_SPEED, STOP_DWELL, SEGMENT_TIMEOUT
         if isinstance(trajectory, SegmentedRoute):
             return self._execute_segments(trajectory, before, goal, digest)
@@ -455,6 +502,10 @@ class RosBackend:
         self.motion_pending = True
         try:
             if self.hardware:
+                if self.settings.floor_guard:
+                    region = self._call(self.floor_region, SetBool.Request(data=near_floor))
+                    if not region.success:
+                        raise AgentError('Driver rejected floor speed region: ' + region.message)
                 gate = self._call(self.gate, SetBool.Request(data=True))
                 if not gate.success:
                     raise AgentError('Hardware execution gate rejected: ' + gate.message)
@@ -472,13 +523,21 @@ class RosBackend:
                 # the state that will move.
                 if segment and max(map(abs, current['velocities_rad_s'])) > STOPPED_SPEED:
                     raise AgentError('Arm moved during segment setup; stop and re-plan')
-                if self.settings.mujoco_preflight and not segment and (
+                if self.settings.mujoco_preflight and not segment:
+                    from .core import (MUJOCO_SETUP_JOINT_TOLERANCE_RAD,
+                                       MUJOCO_SETUP_GRIPPER_TOLERANCE_M)
+                    joint_drift = distance(current['joints_rad'], before['joints_rad'])
+                    gripper_drift = abs(current['gripper_width_m'] - before['gripper_width_m'])
+                    if (joint_drift > MUJOCO_SETUP_JOINT_TOLERANCE_RAD
+                            or gripper_drift > MUJOCO_SETUP_GRIPPER_TOLERANCE_M):
+                        raise AgentError('State changed during setup; re-plan for MuJoCo preflight: '
+                                         'joint drift %.9f rad (limit %.6f), gripper drift %.9f m (limit %.6f)' %
+                                         (joint_drift, MUJOCO_SETUP_JOINT_TOLERANCE_RAD,
+                                          gripper_drift, MUJOCO_SETUP_GRIPPER_TOLERANCE_M))
+                    # Preserve the certified curve. Small joint drift is inside its
+                    # tracking envelope; opening drift is included in geometry.
+                if not self.settings.mujoco_preflight and not segment and (
                         distance(current['joints_rad'], before['joints_rad']) > 1e-6
-                        or abs(current['gripper_width_m'] - before['gripper_width_m']) > 1e-6):
-                    # Do not run an expensive validation with the driver armed,
-                    # or replace the trajectory that passed preflight.
-                    raise AgentError('State changed during setup; re-plan for MuJoCo preflight')
-                if not segment and (distance(current['joints_rad'], before['joints_rad']) > 1e-6
                         or abs(current['gripper_width_m'] - before['gripper_width_m']) > 1e-6):
                     trajectory, digest, _ = self._plan_from_state(goal, current)
             request = ExecuteTrajectory.Goal(trajectory=trajectory)
@@ -520,8 +579,12 @@ class RosBackend:
             self.motion_pending = False
             self.goal_handle = None
             return actual
-        except BaseException:
-            self.stop()
+        except BaseException as error:
+            try:
+                self.stop()
+            except Exception as stop_error:
+                # Keep the original execution failure; report stop failure separately.
+                error.stop_error = str(stop_error)
             raise
 
     def commission_abort(self, plan):
@@ -626,7 +689,7 @@ class RosBackend:
                     except (ValueError, AttributeError):
                         errors.append(result.message)
             except Exception as error:
-                errors.append(str(error))
+                errors.append('Driver stop request: ' + str(error))
         if self.pending_goal is not None:
             def cancel_late(future):
                 handle = future.result()
@@ -637,11 +700,11 @@ class RosBackend:
             try:
                 self._wait(self.goal_handle.cancel_goal_async(), timeout=2)
             except Exception as error:
-                errors.append(str(error))
+                errors.append('MoveIt cancellation request: ' + str(error))
         observed = None
         if self.hardware:
             try:
-                # Initial settling (5 s), one bounded recheck (5 s), transport margin.
+                # Observation is bounded independently of repeated transport requests.
                 # Further disturbances never extend this client's total wait.
                 deadline = time.monotonic() + 12.0
                 while time.monotonic() < deadline:
@@ -659,12 +722,18 @@ class RosBackend:
                     raise AgentError('Controlled abort observation timed out')
             except Exception as error:
                 errors.append(str(error))
-        if errors:
+        held = observed is not None and observed.get('status') == 'holding'
+        if errors and not held:
             raise AgentError('Stop could not be confirmed: ' + '; '.join(errors))
+        if held and errors:
+            observed = {**observed, 'transport_warnings': errors}
+            self.last_stop_result = observed
         self.motion_pending = False
         self.goal_handle = None
-        return {'status': 'holding_observed' if self.hardware else 'stop_requested',
-                'source': self.source, 'controlled_abort': observed}
+        self.last_stop_confirmation = {
+            'status': 'holding_observed' if self.hardware else 'stop_requested',
+            'source': self.source, 'controlled_abort': observed, 'transport_warnings': errors}
+        return self.last_stop_confirmation
 
     def _sync_trajectory_start(self, trajectory, current, goal):
         """Align the first controller point with fresh measured feedback."""

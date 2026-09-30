@@ -95,7 +95,7 @@ class PreflightTests(unittest.TestCase):
                             validate('test', trajectory, {'gripper_width_m': .04}, [2.]*7, config())
 
     def setUp(self):
-        self.q = [.6, 1.236, -.034, .729, .037, -.007, -.222]
+        self.q = [.6, .8, -.034, .729, .037, -.007, -.222]
         self.before = {'joints_rad': self.q, 'gripper_width_m': .099631}
         self.settings = config()
         goal = self.q.copy()
@@ -219,8 +219,9 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, 'excursion'):
             guard.check_feedback([1.211]+[0.]*6, [0.]*7, .04, .02)
         guard.check_feedback([1.1]+[0.]*6, [.2]+[0.]*6, .04, .03)
+        guard.check_feedback([1.1]+[0.]*6, [.2]+[0.]*6, .04, .04)
         with self.assertRaisesRegex(AgentError, 'velocity'):
-            guard.check_feedback([1.1]+[0.]*6, [.2]+[0.]*6, .04, .04)
+            guard.check_feedback([1.1]+[0.]*6, [.2]+[0.]*6, .04, .05)
 
     def test_segmented_route_passes_real_model_preflight(self):
         from dataclasses import replace
@@ -232,6 +233,25 @@ class PreflightTests(unittest.TestCase):
         route, summary = backend._prepare_segments(NS(joint_trajectory=self.trajectory), self.before)
         self.assertEqual(len(route.segments), 1)
         self.assertEqual(summary['segments'][0]['mujoco_preflight']['status'], 'passed')
+
+    def test_gripper_padding_contains_allowed_opening_variation(self):
+        from itertools import product
+        from nero_agent.core import GRIPPER_PREFLIGHT_ALLOWANCE_M
+        reference = CollisionScene(description(), self.settings.collision_boxes, .04)
+        reference.distances(self.q)
+        for delta in (-GRIPPER_PREFLIGHT_ALLOWANCE_M, GRIPPER_PREFLIGHT_ALLOWANCE_M):
+            shifted = CollisionScene(description(), self.settings.collision_boxes, .04+delta)
+            shifted.distances(self.q)
+            for name in ('preflight_gripper_link1_0', 'preflight_gripper_link2_0'):
+                g = reference.names.index(name)
+                rotation = reference.data.geom_xmat[g].reshape(3, 3)
+                shifted_rotation = shifted.data.geom_xmat[g].reshape(3, 3)
+                center = reference.data.geom_xpos[g] + rotation @ reference.offsets[g]
+                other_center = shifted.data.geom_xpos[g] + shifted_rotation @ shifted.offsets[g]
+                nominal_size = shifted.sizes[g] - GRIPPER_PREFLIGHT_ALLOWANCE_M/2
+                for signs in product((-1, 1), repeat=3):
+                    corner = other_center + shifted_rotation @ (np.array(signs)*nominal_size)
+                    self.assertTrue(np.all(abs(rotation.T @ (corner-center)) <= reference.sizes[g]+1e-9))
 
 
 if __name__ == '__main__':

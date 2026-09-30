@@ -1,0 +1,2 @@
+-r requirements-mujoco.txt
+viser>=1.0,<2

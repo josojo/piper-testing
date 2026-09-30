@@ -34,6 +34,8 @@ def main(argv=None):
             choice.add_argument('--scripted', action='store_true', help='Fixed inspection/start sequence instead of LLM')
             choice.add_argument('--start-pose', metavar='NAME',
                                 help='Move once to this configured named pose, without contacting the LLM')
+            p.add_argument('--preview-output', type=Path,
+                           help='Export the MuJoCo candidate for offline viewing, including rejected paths')
             p.add_argument('--model')
             p.add_argument('--execute', action='store_true', help='Execute plans; hardware requires per-action confirmation')
             p.add_argument('--abort-qualification-report', type=Path,
@@ -55,6 +57,11 @@ def main(argv=None):
             raise AgentError('Output must not overwrite configuration')
         settings = Settings.parse(strict_json(args.config.read_text()),
                                   require_review=args.command == 'commission-abort' or getattr(args, 'execute', False))
+        if getattr(args, 'preview_output', None) is not None:
+            if args.preview_output.resolve() in (args.config.resolve(), args.output.resolve()):
+                raise AgentError('Preview output must be separate from config and report')
+            if not settings.mujoco_preflight or settings.segmented_execution:
+                raise AgentError('Preview export requires a continuous MuJoCo motion profile')
         if getattr(args, 'start_pose', None) is not None and args.start_pose not in settings.named_poses:
             raise AgentError('Unknown start pose: ' + args.start_pose)
         if args.command == 'commission-abort':
@@ -62,7 +69,7 @@ def main(argv=None):
             if settings.mode != 'hardware':
                 raise AgentError('commission-abort requires hardware configuration')
             settings = replace(settings, max_velocity=.02, max_acceleration=.05, max_excursion=.012,
-                               timeout=4., tolerance=.000501, mujoco_preflight=False, segmented_execution=False)
+                               timeout=4., tolerance=.000501, mujoco_preflight=False, segmented_execution=False, floor_guard=False)
         offline = getattr(args, 'offline_demo', False)
         if offline and (settings.mode != 'mock' or args.execute):
             raise AgentError('--offline-demo forbids --execute and hardware configuration')
@@ -100,6 +107,7 @@ def main(argv=None):
                 print('Segment %d/%d: measured arrival and standstill confirmed' %
                       (event['segment'], event['segment_count']), file=sys.stderr)
         backend.segment_callback = record
+        backend.preview_output = getattr(args, 'preview_output', None)
         if args.command == 'commission-abort':
             from .commissioning import CRITERIA
             before = backend.state()
@@ -155,6 +163,8 @@ def main(argv=None):
         return 2 if args.command == 'commission-abort' and report['status'] != 'passed' else 0
     except (Exception, KeyboardInterrupt) as error:
         report.update(status='rejected_or_aborted', reason=str(error) or type(error).__name__)
+        if getattr(error, 'stop_error', None):
+            report['stop_error'] = error.stop_error
         if hasattr(error, 'settling_diagnostics'):
             report['settling_diagnostics'] = error.settling_diagnostics
         if backend is not None:
@@ -166,13 +176,22 @@ def main(argv=None):
                     report['stop_result'] = backend.stop()
             except Exception as stop_error:
                 report['stop_error'] = str(stop_error)
+            if getattr(backend, 'last_stop_result', None) is not None:
+                report['controlled_abort'] = backend.last_stop_result
+            confirmation = getattr(backend, 'last_stop_confirmation', None)
+            if confirmation is not None and not getattr(backend, 'motion_pending', False):
+                report['stop_status'] = confirmation['status']
+                report['stop_warnings'] = confirmation.get('transport_warnings', [])
+                report.pop('stop_error', None)
         if writable:
             try:
                 write_report(args.output, report)
             except OSError:
                 pass
         print(json.dumps({'status': report['status'], 'reason': report['reason'],
-                          'stop_error': report.get('stop_error')}), file=sys.stderr)
+                          'stop_error': report.get('stop_error'),
+                          'stop_status': report.get('stop_status'),
+                          'stop_warnings': report.get('stop_warnings', [])}), file=sys.stderr)
         return 2
     finally:
         if backend is not None:

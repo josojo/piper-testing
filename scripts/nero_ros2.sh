@@ -14,12 +14,18 @@ case "$operation" in
       echo 'Docker is unavailable or access is denied. Run this script with sudo, or use a ROS Humble environment directly. See README.' >&2
       exit 2
     fi
+    if ! docker image inspect "$image_name" >/dev/null 2>&1; then
+      echo "Required local Docker image '$image_name' is missing. Build it first:" >&2
+      printf '  sudo %q build\n' "$repo_root/scripts/nero_ros2.sh" >&2
+      echo 'Then rerun your original command. This image is not pulled from a registry.' >&2
+      exit 2
+    fi
     if [[ ! -d "$repo_root/reports" && -n ${SUDO_UID:-} ]]; then
       install -d -o "$SUDO_UID" -g "$SUDO_GID" "$repo_root/reports"
     else
       mkdir -p "$repo_root/reports"
     fi
-    runtime=(--rm --init --user "${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}" 
+    runtime=(--pull=never --rm --init --user "${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}"
       --mount "type=bind,source=$repo_root,target=/work" --workdir /work
       --env "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-73}" --env ROS_LOCALHOST_ONLY=1)
     if [[ -t 0 && -t 1 ]]; then runtime+=(-it); fi

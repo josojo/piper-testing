@@ -13,7 +13,8 @@ import xml.etree.ElementTree as ET
 import mujoco
 import numpy as np
 
-from .core import AgentError, JOINTS
+from .core import (AgentError, JOINTS, FLOOR_SLOW_BAND_M, FLOOR_MIN_Z_M,
+                   GRIPPER_PREFLIGHT_ALLOWANCE_M, TRACKING_TOLERANCE_RAD)
 from nero_planner.model import STRUCTURAL_BODY_PAIRS, box_clearances
 
 
@@ -36,8 +37,8 @@ def split(b):
     return np.array([r[0] for r in rows]), np.array([r[-1] for r in rows[::-1]])
 
 
-def retime_interpolation(trajectory, settings):
-    """Slow a validated trajectory to bound its full quintic derivatives."""
+def retime_interpolation(trajectory, settings, allow_speedup=False):
+    """Uniformly retime the full quintic curve, preserving its geometric path."""
     peak_v = peak_a = 0.
     for first, last in zip(trajectory.points, trajectory.points[1:]):
         dt = ((last.time_from_start.sec-first.time_from_start.sec)
@@ -55,9 +56,11 @@ def retime_interpolation(trajectory, settings):
             pieces = [pair for v, a in pieces for pair in zip(split(v), split(a))]
         peak_v = max(peak_v, *(float(np.max(np.abs(v))) for v, _ in pieces))
         peak_a = max(peak_a, *(float(np.max(np.abs(a))) for _, a in pieces))
-    scale = max(1., peak_v/settings.max_velocity,
+    end = trajectory.points[-1].time_from_start
+    duration = end.sec + end.nanosec*1e-9
+    scale = max(.1 / duration if allow_speedup else 1., peak_v/settings.max_velocity,
                 math.sqrt(peak_a/settings.max_acceleration))
-    if scale > 1.:
+    if scale > 1. or (allow_speedup and scale < 1.):
         scale *= 1.02  # Margin for timestamp rounding and bound evaluation.
         end = trajectory.points[-1].time_from_start
         if (end.sec + end.nanosec*1e-9)*scale > settings.timeout:
@@ -169,6 +172,7 @@ class CollisionScene:
         if len(roots) != 1 or next(iter(roots)) not in frames:
             raise AgentError('MuJoCo requires a known fixed transform from model root to base_link')
         root_from_base = np.linalg.inv(frames[next(iter(roots))])
+        self.base_from_root = frames[next(iter(roots))]
         self.obstacles = np.array([b['center_m'] for b in boxes], dtype=float).reshape(-1, 3)
         self.obstacles = self.obstacles @ root_from_base[:3, :3].T + root_from_base[:3, 3]
         self.obstacle_rotations = np.tile(root_from_base[:3, :3], (len(boxes), 1, 1))
@@ -189,9 +193,14 @@ class CollisionScene:
         self.first, self.second = np.array(pairs).T
         ancestry = np.zeros((len(self.names), 7), dtype=bool)
         joint_bodies = list(m.jnt_bodyid[ids])
+        opening_bodies = {m.jnt_bodyid[m.joint(name).id]: factor for name, factor in
+                          (('gripper', 1.), ('gripper_joint1', .5), ('gripper_joint2', .5))}
         for g in range(m.ngeom):
             body = m.geom_bodyid[g]
             while body:
+                # Inflate descendants of opening joints to cover setup drift and
+                # live gripper feedback tolerance, in every spatial direction.
+                self.sizes[g] += opening_bodies.get(body, 0.) * GRIPPER_PREFLIGHT_ALLOWANCE_M
                 if body in joint_bodies:
                     ancestry[g, joint_bodies.index(body)] = True
                 body = m.body_parentid[body]
@@ -211,6 +220,11 @@ class CollisionScene:
                         radius += 2*np.linalg.norm(m.jnt_pos[jid])
                 radius += np.linalg.norm(m.body_pos[body])
                 body = m.body_parentid[body]
+        # Floor checks include every collision geom except the fixed mounting base.
+        # Arm links and all fixed/movable gripper geometry remain included.
+        self.floor_geoms = np.array([i for i in range(m.ngeom)
+                                    if not self.names[i].startswith('preflight_base_link_')])
+        self.floor_motion = radii[self.floor_geoms]
         # Common ancestor rotations preserve relative separation.
         self.motion = np.where(ancestry[self.first], radii[self.first], radii[self.second])
         self.motion *= ancestry[self.first] ^ ancestry[self.second]
@@ -225,6 +239,18 @@ class CollisionScene:
         return box_clearances(centers, rotations, self.sizes, self.first, self.second)
 
 
+    def floor_heights(self):
+        """Lowest padded box points above base_link z=0 after distances(q)."""
+        rotations = self.data.geom_xmat.reshape(-1, 3, 3)
+        centers = self.data.geom_xpos + np.einsum('nij,nj->ni', rotations, self.offsets)
+        transform = self.base_from_root
+        centers = centers @ transform[:3, :3].T + transform[:3, 3]
+        rotations = np.einsum('ij,njk->nik', transform[:3, :3], rotations)
+        heights = centers[:, 2] - np.einsum('ni,ni->n', abs(rotations[:, 2, :]),
+                                           self.sizes[:self.model.ngeom])
+        return heights[self.floor_geoms]
+
+
 def validate(description, trajectory, before, initial, settings):
     """Reject on collision, bounds, or exhausted continuous-check budget."""
     try:
@@ -232,9 +258,10 @@ def validate(description, trajectory, before, initial, settings):
             raise AgentError('MuJoCo requires a complete seven-joint trajectory')
         scene = CollisionScene(description, settings.collision_boxes, before['gripper_width_m'])
         count, minimum = 0, float('inf')
+        minimum_floor = float('inf')
         # Cover a possible controller initial transition from fresh feedback.
         # Include tracking tolerance in each geometric envelope as well.
-        padding = .015
+        padding = TRACKING_TOLERANCE_RAD
         low_limit = np.maximum(scene.ranges[:, 0], np.array(initial)-settings.max_excursion)
         high_limit = np.minimum(scene.ranges[:, 1], np.array(initial)+settings.max_excursion)
         points = trajectory.points
@@ -269,6 +296,19 @@ def validate(description, trajectory, before, initial, settings):
                 tracking_loss = scene.motion @ np.full(7, padding)
                 bounds = distances-interpolation_loss-tracking_loss
                 clearance = float(np.min(bounds))
+                floor_bound = float('inf')
+                floor_refine = False
+                if settings.floor_guard:
+                    heights = scene.floor_heights()
+                    floor_loss = scene.floor_motion @ (np.maximum(q-lower, upper-q) + padding)
+                    floor_bound = float(np.min(heights-floor_loss))
+                    if np.min(heights) < FLOOR_MIN_Z_M:
+                        raise AgentError('Arm/gripper crosses floor minimum z %.6f m: %.6f m' %
+                                         (FLOOR_MIN_Z_M, np.min(heights)))
+                    # Refine ambiguous interior intervals to avoid slowing a high path
+                    # merely because a coarse motion bound reaches the slow band.
+                    nominal = float(np.min(heights-scene.floor_motion @ np.full(7, padding)))
+                    floor_refine = floor_bound < FLOOR_MIN_Z_M + FLOOR_SLOW_BAND_M <= nominal and depth < 12
                 # Subdivide derivative curves directly. Differentiating tiny
                 # position subsegments amplifies cancellation by 1/span².
                 bounded = (np.all(lower >= low_limit) and np.all(upper <= high_limit)
@@ -297,14 +337,17 @@ def validate(description, trajectory, before, initial, settings):
                     (interval, at, at+span, depth, scene.names[scene.first[pair]],
                      scene.names[scene.second[pair]], distances[pair], interpolation_loss[pair],
                      tracking_loss[pair], bounds[pair], padding, '; '.join(violations) or 'none'))
+                if settings.floor_guard:
+                    last_diagnostic += '; floor clearance bound %.6f m (minimum z %.6f m)' % (floor_bound, FLOOR_MIN_Z_M)
                 if distances[worst] < .003:
                     raise AgentError('MuJoCo clearance rejected: ' + last_diagnostic)
-                if clearance >= .003 and bounded:
+                if clearance >= .003 and bounded and floor_bound >= FLOOR_MIN_Z_M and not floor_refine:
                     minimum = min(minimum, clearance)
+                    minimum_floor = min(minimum_floor, floor_bound)
                     continue
                 if depth >= 16:
                     raise AgentError('MuJoCo could not certify interpolation bounds/clearance '
-                                     'including 0.015-rad tracking allowance: ' + last_diagnostic)
+                                     'including %.3f-rad tracking allowance: ' % padding + last_diagnostic)
                 vl, vr = split(velocity)
                 al, ar = split(acceleration)
                 pending.extend(((left, vl, al, span/2, depth+1, at),
@@ -312,6 +355,9 @@ def validate(description, trajectory, before, initial, settings):
         return {'status': 'passed', 'scope': 'kinematic geometry; not physical dynamics validation',
                 'intervals_checked': count, 'minimum_clearance_bound_m': minimum,
                 'tracking_allowance_rad': padding,
+                'gripper_opening_allowance_m': GRIPPER_PREFLIGHT_ALLOWANCE_M,
+                'minimum_floor_clearance_bound_m': minimum_floor if settings.floor_guard else None,
+                'floor_minimum_z_m': FLOOR_MIN_Z_M if settings.floor_guard else None,
                 'kinematic_inertial_placeholders': scene.inertial_placeholders,
                 'robot_description_sha256': hashlib.sha256(description.encode()).hexdigest()}
     except AgentError:

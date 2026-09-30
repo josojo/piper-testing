@@ -10,6 +10,7 @@ import math
 import time
 
 from .core import AgentError, JOINTS, MAX_EXCURSION_RAD, LARGE_EXCURSION_RAD, SEGMENT_EXCURSION_RAD
+from .core import FLOOR_EXCURSION_RAD, INTERIOR_ACCELERATION
 from .stream_guard import StreamGuard
 from .controlled_abort import ControlledAbort
 
@@ -21,11 +22,12 @@ def main():
     parser.add_argument('--diagnostic-duration', type=float, default=30.)
     parser.add_argument('--abort-qualification-report', type=str)
     parser.add_argument('--motor-velocity-limit', type=float, default=0.10,
-                        help='Temporary motor-feedback trip limit in rad/s (0.10-0.15)')
+                        help='Bounded/near-floor motor-feedback trip limit (0.10-0.15 rad/s); floor interior uses 0.30')
     parser.add_argument('--namespace', default='/nero')
     profile = parser.add_mutually_exclusive_group()
     profile.add_argument('--large-motion', action='store_true')
     profile.add_argument('--segmented-motion', action='store_true')
+    profile.add_argument('--floor-motion', action='store_true')
     args = parser.parse_args()
     if not math.isfinite(args.diagnostic_duration) or not 1 <= args.diagnostic_duration <= 120:
         parser.error('diagnostic duration must be between 1 and 120 seconds')
@@ -34,6 +36,8 @@ def main():
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import JointState
+    from control_msgs.msg import JointTrajectoryControllerState
+    from .tracking_diagnostic import ControllerTrace
     from std_msgs.msg import Empty, String
     from std_srvs.srv import SetBool, Trigger
     from action_msgs.srv import CancelGoal
@@ -49,6 +53,7 @@ def main():
             self.recorder = None
             self.diagnostic_end = None
             self.guard = None
+            self.floor_near = None
             self.trial = None
             self.last_state = None
             self.last_width = None
@@ -56,11 +61,15 @@ def main():
             self.fault = None
             self.feedback_error = None
             self.velocity_trip_history = None
+            self.tracking_diagnostic = None
+            self.controller_trace = ControllerTrace()
             self.cancel_client = self.create_client(CancelGoal, 'arm_controller/follow_joint_trajectory/_action/cancel_goal')
             self.abort = ControlledAbort(hardware, self.block_stream, self.cancel_controller)
             self.fault_pub = self.create_publisher(String, 'project/fault', 10)
             self.publisher = self.create_publisher(JointState, 'feedback/joint_states', 10)
             self.create_subscription(JointState, 'control/joint_commands', self.command, 1)
+            self.create_subscription(JointTrajectoryControllerState, 'arm_controller/controller_state',
+                                     self.controller_trace.observe, 10)
             self.create_subscription(Empty, 'project/heartbeat', self.heartbeat, 1)
             self.create_service(Trigger, 'project/commission_abort', self.commission_gate)
             if args.diagnose_feedback:
@@ -72,6 +81,7 @@ def main():
             self.create_service(Trigger, 'project/abort_report', self.abort_report)
             self.create_service(Trigger, 'project/emergency_stop', self.emergency_stop)
             self.create_service(SetBool, 'project/control_enable', self.gate)
+            self.create_service(SetBool, 'project/floor_near', self.set_floor_region)
             self.create_timer(0.01, self.tick)
 
         def gripper(self):
@@ -185,6 +195,12 @@ def main():
             return self.abort.start(self.fault or 'Operator/application controlled abort')
 
         def block_stream(self):
+            if self.guard is not None and self.tracking_diagnostic is None:
+                self.tracking_diagnostic = {
+                    'captured_monotonic_s': time.monotonic(),
+                    'reason': self.fault or 'Operator/application controlled abort',
+                    'bridge_history': list(self.guard.history),
+                    'controller': self.controller_trace.snapshot()}
             self.guard = None
 
         def cancel_controller(self):
@@ -195,6 +211,8 @@ def main():
 
         def abort_result(self, full=False):
             result = self.abort.result()
+            if full and self.tracking_diagnostic is not None:
+                result['tracking_diagnostic'] = self.tracking_diagnostic
             if full and self.velocity_trip_history is not None:
                 result['velocity_trip_history'] = self.velocity_trip_history
             trial = self.trial or self.diagnostic_trial
@@ -229,6 +247,7 @@ def main():
                 width, _ = self.gripper()
                 now = time.monotonic()
                 self.trial = MovingAbortTrial(state.joints_rad, now)
+                self.abort.SETTLE_TIMEOUT = 5.0
                 self.abort.STOPPED_SPEED = .003
                 self.abort.HOLD_DWELL = 2.0
                 self.abort.POSITION_TOLERANCE = .002
@@ -274,6 +293,18 @@ def main():
                 response.success, response.message = False, str(error)
             return response
 
+        def set_floor_region(self, request, response):
+            # Select once, while disarmed, for the next checked trajectory.
+            response.success = bool(args.floor_motion and not args.commission_abort
+                                    and not args.diagnose_feedback and self.guard is None
+                                    and not self.fault and self.abort.phase == 'idle')
+            if response.success:
+                self.floor_near = bool(request.data)
+                response.message = 'Floor speed region selected'
+            else:
+                response.message = 'Floor region requires an idle floor-profile driver'
+            return response
+
         def gate(self, request, response):
             if args.diagnose_feedback:
                 response.success, response.message = False, 'Hardware writes blocked in feedback diagnostic mode'
@@ -294,15 +325,28 @@ def main():
                 return response
             try:
                 if request.data:
+                    if args.floor_motion and self.floor_near is None:
+                        raise AgentError('Floor profile requires a checked speed region before each move')
+                    near_floor = self.floor_near
+                    self.floor_near = None
+                    fast_floor = args.floor_motion and not near_floor
                     self.hardware.stationary(require_enabled=True)
-                    self.hardware.configure_acceleration()
+                    if fast_floor:
+                        self.hardware.configure_acceleration(INTERIOR_ACCELERATION, allow_increase=True)
+                    elif args.floor_motion:
+                        self.hardware.configure_acceleration(.03)
+                    else:
+                        self.hardware.configure_acceleration()
                     state = self.hardware.stationary(require_enabled=True)
                     width, _ = self.gripper()
                     self.last_state, self.last_width, self.received = state, width, time.monotonic()
                     self.guard = StreamGuard(state.joints_rad, width, self.received,
-                                             args.motor_velocity_limit,
+                                             .30 if fast_floor else args.motor_velocity_limit,
+                                             FLOOR_EXCURSION_RAD if args.floor_motion else
                                              SEGMENT_EXCURSION_RAD if args.segmented_motion else
-                                             LARGE_EXCURSION_RAD if args.large_motion else MAX_EXCURSION_RAD)
+                                             LARGE_EXCURSION_RAD if args.large_motion else MAX_EXCURSION_RAD,
+                                             command_velocity_limit=.25 if fast_floor else .10,
+                                             position_velocity_limit=.50 if fast_floor else .15)
                     # Setup uses blocking SDK reads. Refresh publication before
                     # acknowledging the gate so clients do not inherit old state.
                     self.tick()
@@ -329,7 +373,8 @@ def main():
                 by_name = dict(zip(msg.name, msg.position))
                 q = [by_name[n] for n in JOINTS]
                 stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-                q = self.guard.command(q, self.last_state.joints_rad, stamp, time.time(), time.monotonic())
+                q = self.guard.command(q, self.last_state.joints_rad, stamp, time.time(), time.monotonic(),
+                                       position_timestamps=self.last_state.joint_position_timestamps)
                 if self.trial:
                     self.trial.command(q, stamp, time.monotonic())
                 # The ROS2 joint_trajectory_controller supplies timed

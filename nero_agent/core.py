@@ -12,6 +12,16 @@ JOINTS = tuple('joint%d' % i for i in range(1, 8))
 MAX_EXCURSION_RAD = 0.30
 LARGE_EXCURSION_RAD = 1.20
 SEGMENT_EXCURSION_RAD = 0.10
+FLOOR_EXCURSION_RAD = 2 * math.pi
+INTERIOR_VELOCITY = 0.20
+INTERIOR_ACCELERATION = 0.50
+TRACKING_TOLERANCE_RAD = .015
+MUJOCO_SETUP_JOINT_TOLERANCE_RAD = .001
+MUJOCO_SETUP_GRIPPER_TOLERANCE_M = .0001
+# Include setup drift plus the driver's 1 mm in-flight opening allowance.
+GRIPPER_PREFLIGHT_ALLOWANCE_M = MUJOCO_SETUP_GRIPPER_TOLERANCE_M + .001
+FLOOR_MIN_Z_M = -0.04
+FLOOR_SLOW_BAND_M = 0.04
 
 
 class AgentError(RuntimeError):
@@ -67,6 +77,7 @@ class Settings:
     namespace: str = '/nero'
     mujoco_preflight: bool = False
     segmented_execution: bool = False
+    floor_guard: bool = False
 
     @classmethod
     def parse(cls, data, require_review=True):
@@ -76,8 +87,8 @@ class Settings:
         if data.get('mode') not in ('mock', 'hardware'):
             raise AgentError('Configuration mode must be mock or hardware')
         profile = data.get('motion_profile', 'bounded')
-        if profile not in ('bounded', 'mujoco_large', 'mujoco_segmented'):
-            raise AgentError('motion_profile must be bounded, mujoco_large or mujoco_segmented')
+        if profile not in ('bounded', 'mujoco_large', 'mujoco_segmented', 'mujoco_floor'):
+            raise AgentError('motion_profile must be bounded, mujoco_large, mujoco_segmented or mujoco_floor')
         if require_review and data['mode'] == 'hardware' and data.get('reviewed_hardware') is not True:
             raise AgentError('Hardware requires reviewed_hardware=true after reviewing frames, tool and collision boxes')
         ns = data.get('namespace', '/nero')
@@ -137,9 +148,13 @@ class Settings:
             if min(b['size_m']) <= 0:
                 raise AgentError('Collision box sizes must be positive')
         return cls(data['mode'], poses, tuple(boxes), namespace=ns,
-                   max_excursion=3.14 if profile == 'mujoco_segmented' else
+                   max_velocity=INTERIOR_VELOCITY if profile == 'mujoco_floor' else .08,
+                   max_acceleration=INTERIOR_ACCELERATION if profile == 'mujoco_floor' else .15,
+                   floor_guard=profile == 'mujoco_floor',
+                   max_excursion=FLOOR_EXCURSION_RAD if profile == 'mujoco_floor' else
+                   3.14 if profile == 'mujoco_segmented' else
                    LARGE_EXCURSION_RAD if profile == 'mujoco_large' else MAX_EXCURSION_RAD,
-                   timeout=600.0 if profile == 'mujoco_segmented' else 90.0 if profile == 'mujoco_large' else 30.0,
+                   timeout=600.0 if profile in ('mujoco_segmented', 'mujoco_floor') else 90.0 if profile == 'mujoco_large' else 30.0,
                    mujoco_preflight=profile != 'bounded',
                    segmented_execution=profile == 'mujoco_segmented')
 
